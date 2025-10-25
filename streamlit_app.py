@@ -1,4 +1,39 @@
-# streamlit_app.py
+
+# streamlit_app.py (Lite Boot + Core App)
+import time
+import streamlit as st
+
+st.set_page_config(page_title="🎧 Live Spotify Data", page_icon="🎧", layout="wide")
+
+def hard_reset():
+    st.cache_data.clear()
+    st.cache_resource.clear()
+    st.session_state.clear()
+    st.query_params.update({"v": str(int(time.time())), "sid": str(int(time.time()) % 100000), "mode": "core"})
+    st.rerun()
+
+mode = st.query_params.get("mode") or "safe"
+if mode == "safe":
+    st.title("🎧 Live Spotify Data — Lite Boot")
+    st.caption("Loads a minimal shell first to avoid stale caches or stuck sessions.")
+    col1, col2, col3 = st.columns([1,1,1])
+    with col1:
+        if st.button("Enter App"):
+            st.query_params.update({"mode": "core", "v": str(int(time.time()))})
+            st.rerun()
+    with col2:
+        if st.button("Reset App (hard)"):
+            hard_reset()
+    with col3:
+        st.link_button("Open Core (new tab)", url="?mode=core&v="+str(int(time.time())), type="secondary")
+    with st.expander("If it hangs later…"):
+        st.write("Use **Reset App (hard)** to clear Streamlit caches + session and bump a cache-busting version, then reload the core app.")
+    st.stop()
+
+try:
+    # CORE START
+    
+# ---- CORE APP (existing logic) ----
 import os
 import time
 import json
@@ -11,73 +46,48 @@ import requests
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
-st.set_page_config(page_title="Live Spotify Data", page_icon="🎧", layout="wide")
-
-# ==============================
-# Versioning & Cache Busting
-# ==============================
 APP_VERSION = os.environ.get("APP_VERSION", None) or st.query_params.get("v") or "0"
-
 
 def _rand_sid(n=6) -> str:
     import random, string
     return "".join(random.choices(string.ascii_lowercase + string.digits, k=n))
 
-
-# ==============================
-# Config fetch (deferred; no secrets at import)
-# ==============================
 def get_config() -> Dict[str, str]:
     try:
         client_id = st.secrets["SPOTIFY_CLIENT_ID"]
         client_secret = st.secrets["SPOTIFY_CLIENT_SECRET"]
         redirect_uri = st.secrets.get("SPOTIFY_REDIRECT_URI")
     except Exception:
-        st.error("Missing Spotify secrets. Please set them in .streamlit/secrets.toml")
+        st.error("Missing Spotify secrets. Set SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, SPOTIFY_REDIRECT_URI in .streamlit/secrets.toml")
         st.stop()
 
     qp_redirect = st.query_params.get("redirect_uri")
     if qp_redirect:
         redirect_uri = qp_redirect
-    return {
-        "CLIENT_ID": client_id,
-        "CLIENT_SECRET": client_secret,
-        "REDIRECT_URI": redirect_uri,
-    }
-
+    return {"CLIENT_ID": client_id, "CLIENT_SECRET": client_secret, "REDIRECT_URI": redirect_uri}
 
 cfg = get_config()
 CLIENT_ID = cfg["CLIENT_ID"]
 CLIENT_SECRET = cfg["CLIENT_SECRET"]
 REDIRECT_URI = cfg["REDIRECT_URI"]
 
-SCOPES = (
-    "user-read-currently-playing user-read-playback-state user-read-recently-played"
-)
-
+SCOPES = "user-read-currently-playing user-read-playback-state user-read-recently-played"
 AUTH_URL = "https://accounts.spotify.com/authorize"
 TOKEN_URL = "https://accounts.spotify.com/api/token"
 API_ME_PLAYER = "https://api.spotify.com/v1/me/player/currently-playing"
 API_RECENTS = "https://api.spotify.com/v1/me/player/recently-played"
 API_AUDIO_FEATURES = "https://api.spotify.com/v1/audio-features"
-
 REQUEST_TIMEOUT = 8
 MAX_RETRIES = 2
 
-
-# ==============================
-# HTTP session (salted by version)
-# ==============================
 @st.cache_resource(show_spinner=False)
 def _http(version_salt: str) -> requests.Session:
     s = requests.Session()
     s.headers.update({"Accept": "application/json"})
     return s
 
-
 def _b64_client_creds() -> str:
     return base64.b64encode(f"{CLIENT_ID}:{CLIENT_SECRET}".encode()).decode()
-
 
 def _auth_link(state: str) -> str:
     params = {
@@ -90,23 +100,17 @@ def _auth_link(state: str) -> str:
     }
     return f"{AUTH_URL}?{urlencode(params)}"
 
-
 def _exchange_code_for_token(code: str) -> Dict:
     headers = {
         "Authorization": f"Basic {_b64_client_creds()}",
         "Content-Type": "application/x-www-form-urlencoded",
     }
-    data = {
-        "grant_type": "authorization_code",
-        "code": code,
-        "redirect_uri": REDIRECT_URI,
-    }
+    data = {"grant_type": "authorization_code", "code": code, "redirect_uri": REDIRECT_URI}
     resp = _http(APP_VERSION).post(TOKEN_URL, headers=headers, data=data, timeout=REQUEST_TIMEOUT)
     resp.raise_for_status()
     tok = resp.json()
     tok["expires_at"] = int(time.time()) + int(tok.get("expires_in", 3600)) - 30
     return tok
-
 
 def _refresh_access_token(refresh_token: str) -> Dict:
     headers = {
@@ -121,7 +125,6 @@ def _refresh_access_token(refresh_token: str) -> Dict:
         tok["refresh_token"] = refresh_token
     tok["expires_at"] = int(time.time()) + int(tok.get("expires_in", 3600)) - 30
     return tok
-
 
 def ensure_token() -> Optional[Dict]:
     tok = st.session_state.get("spotify_token")
@@ -148,17 +151,15 @@ def ensure_token() -> Optional[Dict]:
             v = st.query_params.get("v")
             st.query_params.clear()
             if v:
-                st.query_params.update({"v": v})
+                st.query_params.update({"v": v, "mode": "core"})
             return tok
         except Exception as e:
             st.error(f"Token exchange failed: {e}")
             return None
     return None
 
-
 def _auth_header(access_token: str) -> Dict[str, str]:
     return {"Authorization": f"Bearer {access_token}"}
-
 
 def _get_with_retry(url: str, headers: Dict[str, str], params: Dict = None) -> Tuple[int, Dict | None]:
     params = params or {}
@@ -173,13 +174,9 @@ def _get_with_retry(url: str, headers: Dict[str, str], params: Dict = None) -> T
             last_err = resp.text
         except Exception as e:
             last_err = str(e)
-        time.sleep(0.3)
+        time.sleep(0.25 * (attempt + 1))
     return 599, {"error": last_err or "Unknown error"}
 
-
-# ==============================
-# Spotify Audio Features
-# ==============================
 @st.cache_data(ttl=120, show_spinner=False)
 def get_audio_features_batch(access_token: str, track_ids: list[str], version_salt: str) -> Dict[str, Dict]:
     """Return dict id -> features for up to 100 IDs via /audio-features?ids=..."""
@@ -188,7 +185,7 @@ def get_audio_features_batch(access_token: str, track_ids: list[str], version_sa
     if not ids:
         return result
     for i in range(0, len(ids), 100):
-        chunk = ids[i : i + 100]
+        chunk = ids[i:i+100]
         params = {"ids": ",".join(chunk)}
         status, payload = _get_with_retry(API_AUDIO_FEATURES, _auth_header(access_token), params=params)
         if status == 200 and isinstance(payload, dict):
@@ -197,16 +194,13 @@ def get_audio_features_batch(access_token: str, track_ids: list[str], version_sa
                     result[f["id"]] = f
     return result
 
-
 def feature_badges(feat: Dict) -> str:
     """Render simple HTML badges for a track's key audio features."""
     if not feat:
         return ""
     def pct(x):
-        try:
-            return int(round(float(x) * 100))
-        except Exception:
-            return 0
+        try: return int(round(float(x) * 100))
+        except Exception: return 0
     tempo = int(round(feat.get("tempo", 0) or 0))
     energy = pct(feat.get("energy", 0))
     valence = pct(feat.get("valence", 0))
@@ -217,18 +211,12 @@ def feature_badges(feat: Dict) -> str:
       <span style='padding:.2rem .4rem;border-radius:.5rem;border:1px solid #ddd;'>😊 Valence: {valence}%</span>
       <span style='padding:.2rem .4rem;border-radius:.5rem;border:1px solid #ddd;'>🕺 Dance: {dance}%</span>
       <span style='padding:.2rem .4rem;border-radius:.5rem;border:1px solid #ddd;'>⏱️ Tempo: {tempo} BPM</span>
-    </div>
-    """
+    </div>"""
     return html
 
-
-# ==============================
-# OpenAI AI Knowledge
-# ==============================
 def ask_openai_about_track(api_key: str, model: str, track: Dict, artists: str) -> str:
     """Call OpenAI to get facts & meaning for a track."""
-    if not api_key:
-        return ""
+    if not api_key: return ""
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     name = track.get("name", "Unknown Track")
     album = (track.get("album") or {}).get("name", "Unknown Album")
@@ -264,10 +252,6 @@ Return in this structure:
     except Exception as e:
         return f"OpenAI request failed: {e}"
 
-
-# ==============================
-# Display Helpers
-# ==============================
 def display_now_playing(payload: Dict | None):
     if not payload:
         st.info("Nothing is currently playing.")
@@ -280,8 +264,7 @@ def display_now_playing(payload: Dict | None):
     with st.container(border=True):
         cols = st.columns([1, 3])
         with cols[0]:
-            if art:
-                st.image(art, use_container_width=True)
+            if art: st.image(art, use_container_width=True)
         with cols[1]:
             st.markdown(f"### 🎵 {name}")
             st.caption(f"{artists} — {album}")
@@ -289,13 +272,20 @@ def display_now_playing(payload: Dict | None):
             if track_id:
                 feats = get_audio_features_batch(st.session_state["spotify_token"]["access_token"], [track_id], version_salt=APP_VERSION)
                 f = feats.get(track_id)
-                if f:
-                    st.markdown(feature_badges(f), unsafe_allow_html=True)
-
+                if f: st.markdown(feature_badges(f), unsafe_allow_html=True)
+    with st.expander("🧠 AI Knowledge (optional)", expanded=False):
+        st.caption("Paste your OpenAI API key locally (not stored).")
+        if "openai_key" not in st.session_state: st.session_state["openai_key"] = ""
+        st.session_state["openai_key"] = st.text_input("OpenAI API Key", type="password", value=st.session_state["openai_key"])
+        model = st.selectbox("Model", ["gpt-4.1-mini", "gpt-4o-mini", "gpt-4.1"], index=0)
+        custom_model = st.text_input("Custom model (optional)")
+        chosen_model = custom_model.strip() or model
+        if st.session_state.get("openai_key") and st.button("Get AI Knowledge for current song"):
+            md = ask_openai_about_track(st.session_state["openai_key"], chosen_model, item, artists)
+            st.markdown(md)
 
 def display_recent(payload: Dict | None):
-    if not payload:
-        return
+    if not payload: return
     items = payload.get("items", [])
     ids = [(it.get("track") or {}).get("id") for it in items]
     feats_map = get_audio_features_batch(st.session_state["spotify_token"]["access_token"], ids, version_salt=APP_VERSION)
@@ -309,8 +299,7 @@ def display_recent(payload: Dict | None):
         with st.container(border=True):
             cols = st.columns([1, 3])
             with cols[0]:
-                if art:
-                    st.image(art, use_container_width=True)
+                if art: st.image(art, use_container_width=True)
             with cols[1]:
                 st.markdown(f"**{name}**")
                 st.caption(f"{artists} — {album}")
@@ -318,57 +307,57 @@ def display_recent(payload: Dict | None):
         if tid and tid in feats_map:
             st.markdown(feature_badges(feats_map[tid]), unsafe_allow_html=True)
 
+def run_core_app():
+    now = time.time()
+    last = st.session_state.get("_last_active_ts", now)
+    st.session_state["_last_active_ts"] = now
+    if now - last > 20 * 60:
+        st.info("Session was idle. If things seem stale, use **Reset App** in the sidebar.")
 
-# ==============================
-# UI
-# ==============================
-st.title("🎧 Live Spotify Data")
-st.caption("Now Playing + Recent Plays with audio mood + optional AI Knowledge")
+    st.title("🎧 Live Spotify Data")
+    st.caption("Now Playing + Recent Plays with audio mood + optional AI Knowledge")
 
-limit = st.sidebar.slider("Recent tracks to show", 1, 50, 10)
-auto_refresh = st.sidebar.checkbox("Auto-refresh Now Playing (10s)", True)
+    with st.sidebar:
+        limit = st.slider("Recent tracks to show", 1, 50, 10)
+        auto_refresh = st.checkbox("Auto-refresh Now Playing (10s)", True)
+        if st.button("Reset App (hard)"):
+            st.cache_data.clear(); st.cache_resource.clear(); st.session_state.clear()
+            st.query_params.update({"v": str(int(time.time())), "sid": _rand_sid(), "mode": "core"})
+            st.rerun()
 
-# Force clean session
-if st.sidebar.button("Force clean session"):
-    st.cache_data.clear()
-    st.cache_resource.clear()
-    st.session_state.clear()
-    st.query_params.update({"v": str(int(time.time())), "sid": _rand_sid()})
-    st.rerun()
+    if not REDIRECT_URI:
+        st.error("Missing SPOTIFY_REDIRECT_URI in secrets."); st.stop()
 
-if not REDIRECT_URI:
-    st.error("Missing SPOTIFY_REDIRECT_URI in secrets.")
+    token = ensure_token()
+    if not token:
+        if "oauth_state" not in st.session_state:
+            st.session_state["oauth_state"] = hashlib.sha256(os.urandom(32)).hexdigest()
+        st.link_button("🔓 Login with Spotify", _auth_link(st.session_state["oauth_state"]), type="primary")
+        st.stop()
+
+    if auto_refresh:
+        st_autorefresh(interval=10_000, key=f"nowplaying_refresh_{APP_VERSION}")
+
+    access_token = token["access_token"]
+
+    code_np, payload_np = _get_with_retry(API_ME_PLAYER, _auth_header(access_token))
+    if code_np == 200:
+        display_now_playing(payload_np)
+    elif code_np == 204:
+        st.info("Nothing currently playing.")
+    else:
+        st.error(f"Failed to fetch 'Now Playing' (status {code_np}).")
+
+    code_rc, payload_rc = _get_with_retry(API_RECENTS, _auth_header(access_token), params={"limit": 10})
+    if code_rc == 200:
+        display_recent(payload_rc)
+    else:
+        st.error(f"Failed to fetch 'Recently Played' (status {code_rc}).")
+
+    # CORE END
+except Exception as e:
+    st.error("Core app failed to start. Use **Reset App (hard)** and try again.")
+    st.exception(e)
+    if st.button("Reset App (hard)"):
+        hard_reset()
     st.stop()
-
-token = ensure_token()
-if not token:
-    if "oauth_state" not in st.session_state:
-        st.session_state["oauth_state"] = hashlib.sha256(os.urandom(32)).hexdigest()
-    st.link_button("🔓 Login with Spotify", _auth_link(st.session_state["oauth_state"]), type="primary")
-    st.stop()
-
-if auto_refresh:
-    st_autorefresh(interval=10_000, key=f"nowplaying_refresh_{APP_VERSION}")
-
-access_token = token["access_token"]
-
-status_np, payload_np = _get_with_retry(API_ME_PLAYER, _auth_header(access_token))
-if status_np == 200:
-    display_now_playing(payload_np)
-    with st.expander("🧠 AI Knowledge (optional)", expanded=False):
-        st.caption("Paste your OpenAI API key locally (not stored).")
-        if "openai_key" not in st.session_state:
-            st.session_state["openai_key"] = ""
-        st.session_state["openai_key"] = st.text_input("OpenAI API Key", type="password", value=st.session_state["openai_key"])
-        model = st.selectbox("Model", ["gpt-4.1-mini", "gpt-4o-mini", "gpt-4.1"], index=0)
-        custom_model = st.text_input("Custom model (optional)")
-        chosen_model = custom_model.strip() or model
-        if st.session_state.get("openai_key") and st.button("Get AI Knowledge for current song"):
-            item = payload_np.get("item") or {}
-            artists = ", ".join([a["name"] for a in item.get("artists", [])])
-            md = ask_openai_about_track(st.session_state["openai_key"], chosen_model, item, artists)
-            st.markdown(md)
-
-status_rc, payload_rc = _get_with_retry(API_RECENTS, _auth_header(access_token), params={"limit": limit})
-if status_rc == 200:
-    display_recent(payload_rc)
