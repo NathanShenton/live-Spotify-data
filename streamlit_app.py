@@ -1,4 +1,6 @@
-# app.py — Spotify Now Playing + Mood (PKCE, sticky-state, hardened)
+# app.py — Spotify Now Playing + Mood
+# PKCE (no client secret), sticky-state restore, immediate token exchange,
+# tight timeouts, smallest images, caching, lazy OpenAI import, full diagnostics.
 
 from typing import Optional
 import os, json, base64, hashlib, secrets
@@ -9,8 +11,8 @@ import requests
 import streamlit as st
 
 # ---------- Fast boot knobs ----------
-REQUEST_TIMEOUT = 8   # seconds
-IMG_INDEX = -1        # smallest album image
+REQUEST_TIMEOUT = 8    # seconds for all HTTP calls
+IMG_INDEX = -1         # smallest album image
 
 st.set_page_config(page_title="Spotify Now + Mood (PKCE)", page_icon="🎧", layout="wide")
 
@@ -24,7 +26,7 @@ SCOPES = [
 def _init_state():
     ss = st.session_state
     ss.setdefault("spotify_client_id", "")
-    ss.setdefault("redirect_uri", "")        # exact app URL, no trailing slash unless added in Spotify
+    ss.setdefault("redirect_uri", "")         # exact Streamlit URL, no trailing slash
     ss.setdefault("openai_api_key", "")
 
     # OAuth/PKCE
@@ -43,7 +45,22 @@ def _init_state():
     ss.setdefault("recent_cache", None)
     ss.setdefault("mood_json", None)
 
+    # UI control
+    ss.setdefault("auth_url_built", False)  # prevents regenerating verifier mid-flow
+
 _init_state()
+
+# ---------- Diagnostics (token trace) ----------
+EXCHANGE_TRACE = {"request": {}, "response": {}}
+
+def _trace_request(kind, url, data):
+    try:
+        EXCHANGE_TRACE["request"] = {"kind": kind, "url": url, "data": dict(data)}
+    except Exception:
+        EXCHANGE_TRACE["request"] = {"kind": kind, "url": url, "data": "unserializable"}
+
+def _trace_response(status, text):
+    EXCHANGE_TRACE["response"] = {"status": status, "text": (text or "")[:1200]}
 
 # ---------- Helpers ----------
 def now_utc() -> datetime:
@@ -53,19 +70,20 @@ def token_expired() -> bool:
     exp = st.session_state.expires_at
     return (not exp) or (now_utc() >= exp)
 
-def b64url_encode_bytes(b: bytes) -> str:
+def _b64url_encode_bytes(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).decode().rstrip("=")
 
-def b64url_decode_str(s: str) -> bytes:
+def _b64url_decode_str(s: str) -> bytes:
     pad = '=' * (-len(s) % 4)
     return base64.urlsafe_b64decode(s + pad)
 
 def gen_code_verifier() -> str:
-    return b64url_encode_bytes(os.urandom(64))  # ~86 chars, valid (43..128)
+    # 43..128 URL-safe chars; ~86 here
+    return _b64url_encode_bytes(os.urandom(64))
 
 def code_challenge_s256(verifier: str) -> str:
     digest = hashlib.sha256(verifier.encode()).digest()
-    return b64url_encode_bytes(digest)
+    return _b64url_encode_bytes(digest)
 
 def new_csrf_token() -> str:
     return secrets.token_urlsafe(16)
@@ -88,7 +106,8 @@ def read_qp_single(name: str) -> Optional[str]:
     return None
 
 def ms_fmt(ms):
-    if ms is None: return "-"
+    if ms is None:
+        return "-"
     s = ms // 1000
     return f"{s//60}:{s%60:02d}"
 
@@ -103,13 +122,13 @@ def build_auth_url() -> Optional[str]:
     challenge = code_challenge_s256(verifier)
     csrf = new_csrf_token()
 
-    # Save in-session (best case)
+    # Best case: keep in-session
     st.session_state.pkce_code_verifier = verifier
     st.session_state.oauth_state_csrf = csrf
 
-    # Sticky payload (to rebuild after redirect/new session)
+    # Sticky payload: restore after redirect/new session
     payload = {"v": verifier, "cid": cid, "ru": redir}
-    payload_b64 = b64url_encode_bytes(json.dumps(payload).encode("utf-8"))
+    payload_b64 = _b64url_encode_bytes(json.dumps(payload).encode("utf-8"))
 
     # state: "<csrf>.<payload_b64>"
     state_full = f"{csrf}.{payload_b64}"
@@ -124,14 +143,16 @@ def build_auth_url() -> Optional[str]:
         "state": state_full,
         "show_dialog": "false",
     }
+    st.session_state.auth_url_built = True
     return f"https://accounts.spotify.com/authorize?{urlencode(q)}"
 
 def exchange_code_for_token(code: str) -> bool:
     try:
-        cid = st.session_state.spotify_client_id.strip()
-        redir = st.session_state.redirect_uri.strip()
+        cid = (st.session_state.spotify_client_id or "").strip()
+        redir = (st.session_state.redirect_uri or "").strip()
         verifier = st.session_state.pkce_code_verifier
-        if not (cid and redir and verifier):
+
+        if not verifier or not cid or not redir:
             st.session_state.auth_error = "Missing PKCE/client info. Build Spotify login link again."
             return False
 
@@ -139,13 +160,22 @@ def exchange_code_for_token(code: str) -> bool:
         data = {
             "grant_type": "authorization_code",
             "code": code,
-            "redirect_uri": redir,
-            "client_id": cid,
+            "redirect_uri": redir,     # must match /authorize exactly
+            "client_id": cid,          # PKCE uses client_id in body (no Basic auth)
             "code_verifier": verifier,
         }
-        r = requests.post(token_url, data=data, timeout=REQUEST_TIMEOUT)
-        if r is None or r.status_code != 200:
-            st.session_state.auth_error = f"Token exchange failed: {getattr(r,'status_code','—')} {getattr(r,'text','')}"
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+
+        _trace_request("POST", token_url, data)
+        r = requests.post(token_url, data=data, headers=headers, timeout=REQUEST_TIMEOUT)
+        if r is None:
+            st.session_state.auth_error = "No response from token endpoint."
+            return False
+
+        _trace_response(r.status_code, r.text)
+
+        if r.status_code != 200:
+            st.session_state.auth_error = f"Token exchange failed: {r.status_code} {r.text}"
             return False
 
         tok = r.json()
@@ -155,26 +185,33 @@ def exchange_code_for_token(code: str) -> bool:
         st.session_state.expires_at = now_utc() + timedelta(seconds=expires_in - 30)
         st.session_state.authed = True
 
-        # clear one-time vals
+        # clear one-time values
         st.session_state.pkce_code_verifier = None
         st.session_state.oauth_state_csrf = None
+        st.session_state.last_auth_url = None
+        st.session_state.auth_url_built = False
         st.session_state.auth_error = ""
         return True
+
     except Exception as e:
         st.session_state.auth_error = f"Exception during token exchange: {e}"
         return False
 
 def refresh_access_token() -> bool:
-    cid = st.session_state.spotify_client_id.strip()
+    cid = (st.session_state.spotify_client_id or "").strip()
     rt = st.session_state.refresh_token
     if not (cid and rt):
         return False
     token_url = "https://accounts.spotify.com/api/token"
     data = {"grant_type": "refresh_token", "refresh_token": rt, "client_id": cid}
-    r = requests.post(token_url, data=data, timeout=REQUEST_TIMEOUT)
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    _trace_request("POST", token_url, data)
+    r = requests.post(token_url, data=data, headers=headers, timeout=REQUEST_TIMEOUT)
     if r is None or r.status_code != 200:
+        _trace_response(getattr(r, "status_code", "—"), getattr(r, "text", ""))
         st.session_state.auth_error = f"Refresh failed: {getattr(r,'status_code','—')} {getattr(r,'text','')}"
         return False
+    _trace_response(r.status_code, r.text)
     tok = r.json()
     st.session_state.access_token = tok.get("access_token")
     expires_in = tok.get("expires_in", 3600)
@@ -207,7 +244,8 @@ def _audio_features_csv(ids_csv: str):
     return spotify_get("audio-features", params={"ids": ids_csv}) or {}
 
 def get_audio_features(track_ids):
-    if not track_ids: return {}
+    if not track_ids:
+        return {}
     data = _audio_features_csv(",".join(track_ids[:100]))
     out = {}
     for f in (data.get("audio_features") or []):
@@ -225,7 +263,8 @@ def _artists_csv(ids_csv: str):
     return spotify_get("artists", params={"ids": ids_csv}) or {}
 
 def get_artist_genres(artist_ids):
-    if not artist_ids: return []
+    if not artist_ids:
+        return []
     data = _artists_csv(",".join(artist_ids[:50]))
     genres = []
     for a in (data.get("artists") or []):
@@ -234,7 +273,8 @@ def get_artist_genres(artist_ids):
     for g in genres:
         if g not in seen:
             seen.add(g); out.append(g)
-        if len(out) >= 20: break
+        if len(out) >= 20:
+            break
     return out
 
 # ---------- Sidebar ----------
@@ -242,14 +282,15 @@ with st.sidebar:
     st.markdown("## 🔐 Credentials (session-only)")
     st.session_state.spotify_client_id = st.text_input("Spotify Client ID", value=st.session_state.spotify_client_id)
     st.session_state.redirect_uri = st.text_input(
-        "Redirect URI (must match Spotify app exactly)",
+        "Redirect URI (must match Spotify app exactly, no trailing slash)",
         value=st.session_state.redirect_uri or "https://<your-app>.streamlit.app",
     )
     st.session_state.openai_api_key = st.text_input("OpenAI API Key (optional, user-provided)", type="password")
 
     c1, c2 = st.columns(2)
     with c1:
-        if st.button("🔗 Build Spotify Login Link", use_container_width=True):
+        build_disabled = st.session_state.get("auth_url_built", False)
+        if st.button("🔗 Build Spotify Login Link", use_container_width=True, disabled=build_disabled):
             url = build_auth_url()
             if url:
                 st.session_state.last_auth_url = url
@@ -257,14 +298,14 @@ with st.sidebar:
                 st.error("Enter Client ID and Redirect URI first.")
         if st.session_state.get("last_auth_url"):
             st.link_button("Continue to Spotify →", st.session_state.last_auth_url, use_container_width=True)
-            st.caption("If blocked, click the button again.")
+            st.caption("If you change Client ID or Redirect URI, click 'Log out' then rebuild the link.")
 
     with c2:
         if st.button("🚪 Log out", use_container_width=True):
             for k in [
                 "access_token","refresh_token","expires_at","authed",
                 "pkce_code_verifier","oauth_state_csrf","auth_error",
-                "recent_cache","mood_json","last_auth_url"
+                "recent_cache","mood_json","last_auth_url","auth_url_built"
             ]:
                 st.session_state[k] = None
             st.rerun()
@@ -286,6 +327,9 @@ with st.sidebar:
         except Exception as e:
             st.write(f"qp error: {e}")
 
+    with st.expander("🧪 Token Exchange Trace"):
+        st.code(json.dumps(EXCHANGE_TRACE, indent=2))
+
 # ---------- Handle OAuth redirect (ALWAYS restore from sticky state) ----------
 error_val = read_qp_single("error")
 error_desc = read_qp_single("error_description")
@@ -295,20 +339,21 @@ if error_val:
 code_val = read_qp_single("code")
 state_val = read_qp_single("state")
 
-restored = {"cid": None, "ru": None, "verifier_len": None}
+restored = {"cid_masked": None, "ru": None, "verifier_len": None}
 if state_val and "." in state_val:
     csrf_part, payload_b64 = state_val.split(".", 1)
     try:
-        payload = json.loads(b64url_decode_str(payload_b64).decode("utf-8"))
+        payload = json.loads(_b64url_decode_str(payload_b64).decode("utf-8"))
     except Exception:
         payload = {}
-    # ALWAYS overwrite from state to ensure exact match
+
+    # ALWAYS overwrite from state to ensure exact match with /authorize
     if payload.get("v"):
         st.session_state.pkce_code_verifier = payload["v"]
         restored["verifier_len"] = len(payload["v"])
     if payload.get("cid"):
         st.session_state.spotify_client_id = payload["cid"]
-        restored["cid"] = payload["cid"][:6] + "…"
+        restored["cid_masked"] = payload["cid"][:6] + "…"
     if payload.get("ru"):
         st.session_state.redirect_uri = payload["ru"]
         restored["ru"] = payload["ru"]
@@ -323,7 +368,7 @@ if code_val and not st.session_state.authed:
     if ok:
         st.success("Spotify authentication complete.")
         try:
-            st.experimental_set_query_params()  # clear URL
+            st.experimental_set_query_params()  # clear ?code & ?state
         except Exception:
             pass
     else:
@@ -482,4 +527,4 @@ else:
         st.write("_Playlist idea:_ **" + mj.get("suggested_playlist_title", "") + "**")
 
 st.markdown("---")
-st.caption("PKCE with sticky OAuth state (always restored). Public-safe; session-only storage.")
+st.caption("PKCE + sticky OAuth state restore. Same-tab link. Tight timeouts. Full token-trace if anything fails.")
