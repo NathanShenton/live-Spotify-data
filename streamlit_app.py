@@ -1,8 +1,8 @@
 # Streamlit + Spotify Now Playing + Mood (Auth Code via Spotipy)
-# - Uses ONLY st.query_params (no experimental_* APIs)
+# - Only st.query_params (no experimental_* APIs)
 # - Secrets from Streamlit Cloud (no repo secrets)
 # - Tight timeouts, smallest images, caching; lazy OpenAI import
-# - Same-tab authorize; immediate exchange; robust refresh
+# - Same-tab authorize; immediate exchange; robust refresh via JS
 
 from typing import Optional, Dict, Any, List
 import json
@@ -23,6 +23,21 @@ SCOPES = [
 
 st.set_page_config(page_title="Spotify Now + Mood", page_icon="🎧", layout="wide")
 
+# -------------------- Auto-refresh (JS) --------------------
+def enable_auto_refresh(seconds: int = 10):
+    st.markdown(
+        f"""
+        <script>
+        setTimeout(function() {{
+            const url = new URL(window.location);
+            url.searchParams.set('_ts', Date.now().toString()); // bust cache, trigger rerun
+            window.location.replace(url);
+        }}, {int(seconds*1000)});
+        </script>
+        """,
+        unsafe_allow_html=True,
+    )
+
 # -------------------- Secrets (Streamlit Cloud) --------------------
 def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
     try:
@@ -32,7 +47,7 @@ def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
 
 CLIENT_ID = get_secret("SPOTIFY_CLIENT_ID", "")
 CLIENT_SECRET = get_secret("SPOTIFY_CLIENT_SECRET", "")
-REDIRECT_URI = get_secret("SPOTIFY_REDIRECT_URI", "")
+REDIRECT_URI = get_secret("SPOTIFY_REDIRECT_URI", "")  # must match Spotify app exactly
 
 # -------------------- Session init --------------------
 def _init_state():
@@ -42,6 +57,7 @@ def _init_state():
     ss.setdefault("auth_error", "")
     ss.setdefault("openai_api_key", "")
     ss.setdefault("mood_json", None)
+    ss.setdefault("auto_refresh_on", True)
 _init_state()
 
 # -------------------- Helpers --------------------
@@ -124,6 +140,9 @@ with st.sidebar:
         "OpenAI API Key", type="password", value=st.session_state.openai_api_key
     )
 
+    st.markdown("## ⚙️ Auto-refresh")
+    st.session_state.auto_refresh_on = st.toggle("Auto-refresh every 10s", value=st.session_state.auto_refresh_on)
+
     st.markdown("## 🎫 Login")
     if ok:
         try:
@@ -146,7 +165,7 @@ with st.sidebar:
                 st.session_state.authed = True
                 st.success("Authenticated with Spotify.")
                 # Clear params from URL using NEW API
-                qp_clear("code", "state")
+                qp_clear("code", "state", "_ts")
             except Exception as e:
                 st.session_state.auth_error = f"Token exchange failed: {e}"
                 st.error(st.session_state.auth_error)
@@ -177,8 +196,11 @@ if not st.session_state.authed:
 
 # -------------------- Main UI (after auth) --------------------
 st.title("🎧 Spotify Now Playing + Mood")
-st.caption("Authenticated. Auto-refreshing Now Playing every 10s.")
-st.autorefresh(interval=10_000, key="auto_refresh")
+if st.session_state.auto_refresh_on:
+    st.caption("Auto-refreshing Now Playing every 10s.")
+    enable_auto_refresh(10)
+else:
+    st.caption("Auto-refresh is OFF.")
 
 sp = spotify_client()
 if not sp:
@@ -378,4 +400,4 @@ else:
         st.write("_Playlist idea:_ **" + mj.get("suggested_playlist_title", "") + "**")
 
 st.markdown("---")
-st.caption("Authorization Code flow via Spotipy. Only st.query_params used; tokens auto-refreshed in-session.")
+st.caption("Authorization Code flow via Spotipy. Only st.query_params used; tokens auto-refreshed. JS-based auto-refresh for 1.36.")
