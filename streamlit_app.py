@@ -4,19 +4,21 @@ import time
 import json
 import base64
 import hashlib
+from typing import Tuple, Optional, Dict
+from urllib.parse import urlencode
+
 import requests
 import streamlit as st
-from urllib.parse import urlencode
 
 st.set_page_config(page_title="Live Spotify Data", page_icon="🎧", layout="wide")
 
-# --- Configuration (from Streamlit Secrets) ---
+# ==============================
+# Config
+# ==============================
 CLIENT_ID = st.secrets["SPOTIFY_CLIENT_ID"]
 CLIENT_SECRET = st.secrets["SPOTIFY_CLIENT_SECRET"]
-# Prefer secrets; allow override via query param only if explicitly passed
 REDIRECT_URI = st.secrets.get("SPOTIFY_REDIRECT_URI") or st.query_params.get("redirect_uri")
 
-# Scopes for now playing + recents
 SCOPES = "user-read-currently-playing user-read-playback-state user-read-recently-played"
 
 AUTH_URL = "https://accounts.spotify.com/authorize"
@@ -24,12 +26,22 @@ TOKEN_URL = "https://accounts.spotify.com/api/token"
 API_ME_PLAYER = "https://api.spotify.com/v1/me/player/currently-playing"
 API_RECENTS = "https://api.spotify.com/v1/me/player/recently-played"
 
-# --- Helpers ---
-def b64_client_creds(client_id: str, client_secret: str) -> str:
-    creds = f"{client_id}:{client_secret}".encode("utf-8")
-    return base64.b64encode(creds).decode("utf-8")
+REQUEST_TIMEOUT = 8  # seconds
+MAX_RETRIES = 2      # per call
 
-def get_auth_url(state: str) -> str:
+# ==============================
+# HTTP session (connection reuse)
+# ==============================
+@st.cache_resource(show_spinner=False)
+def _http() -> requests.Session:
+    s = requests.Session()
+    s.headers.update({"Accept": "application/json"})
+    return s
+
+def _b64_client_creds() -> str:
+    return base64.b64encode(f"{CLIENT_ID}:{CLIENT_SECRET}".encode()).decode()
+
+def _auth_link(state: str) -> str:
     params = {
         "client_id": CLIENT_ID,
         "response_type": "code",
@@ -40,9 +52,9 @@ def get_auth_url(state: str) -> str:
     }
     return f"{AUTH_URL}?{urlencode(params)}"
 
-def exchange_code_for_token(code: str) -> dict:
+def _exchange_code_for_token(code: str) -> Dict:
     headers = {
-        "Authorization": f"Basic {b64_client_creds(CLIENT_ID, CLIENT_SECRET)}",
+        "Authorization": f"Basic {_b64_client_creds()}",
         "Content-Type": "application/x-www-form-urlencoded",
     }
     data = {
@@ -50,79 +62,107 @@ def exchange_code_for_token(code: str) -> dict:
         "code": code,
         "redirect_uri": REDIRECT_URI,
     }
-    resp = requests.post(TOKEN_URL, headers=headers, data=data, timeout=20)
-    if resp.status_code != 200:
-        st.error(f"Token exchange failed: {resp.status_code} {resp.text}")
-        return {}
+    resp = _http().post(TOKEN_URL, headers=headers, data=data, timeout=REQUEST_TIMEOUT)
+    resp.raise_for_status()
     tok = resp.json()
-    tok["expires_at"] = int(time.time()) + int(tok.get("expires_in", 3600)) - 30  # 30s skew
+    tok["expires_at"] = int(time.time()) + int(tok.get("expires_in", 3600)) - 30
     return tok
 
-def refresh_access_token(refresh_token: str) -> dict:
+def _refresh_access_token(refresh_token: str) -> Dict:
     headers = {
-        "Authorization": f"Basic {b64_client_creds(CLIENT_ID, CLIENT_SECRET)}",
+        "Authorization": f"Basic {_b64_client_creds()}",
         "Content-Type": "application/x-www-form-urlencoded",
     }
     data = {
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
     }
-    resp = requests.post(TOKEN_URL, headers=headers, data=data, timeout=20)
-    if resp.status_code != 200:
-        st.warning(f"Refresh failed: {resp.status_code} {resp.text}")
-        return {}
+    resp = _http().post(TOKEN_URL, headers=headers, data=data, timeout=REQUEST_TIMEOUT)
+    resp.raise_for_status()
     tok = resp.json()
     if "refresh_token" not in tok:
-        tok["refresh_token"] = refresh_token  # keep the old one per Spotify docs
+        tok["refresh_token"] = refresh_token
     tok["expires_at"] = int(time.time()) + int(tok.get("expires_in", 3600)) - 30
     return tok
 
-def ensure_token() -> dict | None:
+def ensure_token() -> Optional[Dict]:
+    # valid token present?
     tok = st.session_state.get("spotify_token")
     if tok and int(time.time()) < tok.get("expires_at", 0):
         return tok
+    # try refresh
     if tok and tok.get("refresh_token"):
-        new_tok = refresh_access_token(tok["refresh_token"])
-        if new_tok:
+        try:
+            new_tok = _refresh_access_token(tok["refresh_token"])
             st.session_state["spotify_token"] = new_tok
             return new_tok
-
-    # Try code in query params (modern API)
+        except Exception as e:
+            st.warning("Token refresh failed. Please re-authenticate.")
+            st.session_state.pop("spotify_token", None)
+    # try auth code in query params
     q = st.query_params
     code = q.get("code")
     if code:
-        state_returned = q.get("state")
         expected = st.session_state.get("oauth_state")
-        if expected and state_returned != expected:
-            st.error("State mismatch. Please try logging in again.")
+        returned = q.get("state")
+        if expected and returned != expected:
+            st.error("State mismatch. Please click login again.")
             return None
-        tok = exchange_code_for_token(code)
-        if tok:
+        try:
+            tok = _exchange_code_for_token(code)
             st.session_state["spotify_token"] = tok
-            # Clean the URL (remove code/state)
+            # clear URL params to avoid loops
             st.query_params.clear()
             return tok
+        except Exception as e:
+            st.error(f"Token exchange failed: {e}")
+            return None
     return None
 
-def auth_header(access_token: str) -> dict:
+def _auth_header(access_token: str) -> Dict[str, str]:
     return {"Authorization": f"Bearer {access_token}"}
 
-def get_currently_playing(access_token: str) -> tuple[int, dict | None]:
-    resp = requests.get(API_ME_PLAYER, headers=auth_header(access_token), timeout=20)
-    if resp.status_code == 204:
-        return (204, None)  # No content
-    if resp.status_code != 200:
-        return (resp.status_code, {"error": resp.text})
-    return (200, resp.json())
+def _get_with_retry(url: str, headers: Dict[str, str], params: Dict = None) -> Tuple[int, Dict | None]:
+    params = params or {}
+    last_err = None
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            resp = _http().get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
+            if resp.status_code == 401 and st.session_state.get("spotify_token", {}).get("refresh_token"):
+                # try refresh once
+                try:
+                    new_tok = _refresh_access_token(st.session_state["spotify_token"]["refresh_token"])
+                    st.session_state["spotify_token"] = new_tok
+                    headers = _auth_header(new_tok["access_token"])
+                    continue
+                except Exception as re:
+                    return 401, {"error": f"Unauthorized and refresh failed: {re}"}
+            if resp.status_code >= 500:
+                # transient server error -> retry
+                last_err = resp.text
+                time.sleep(0.4 * (attempt + 1))
+                continue
+            if resp.status_code == 204:
+                return 204, None
+            if resp.status_code != 200:
+                return resp.status_code, {"error": resp.text}
+            return 200, resp.json()
+        except requests.exceptions.RequestException as e:
+            last_err = str(e)
+            time.sleep(0.2 * (attempt + 1))
+            continue
+    return 599, {"error": last_err or "Unknown network error"}
 
-def get_recent_tracks(access_token: str, limit: int = 10) -> tuple[int, dict | None]:
+def get_currently_playing(access_token: str) -> Tuple[int, Dict | None]:
+    return _get_with_retry(API_ME_PLAYER, _auth_header(access_token))
+
+@st.cache_data(ttl=60, show_spinner=False)
+def get_recent_tracks_cached(access_token: str, limit: int) -> Tuple[int, Dict | None]:
     params = {"limit": max(1, min(limit, 50))}
-    resp = requests.get(API_RECENTS, headers=auth_header(access_token), params=params, timeout=20)
-    if resp.status_code != 200:
-        return (resp.status_code, {"error": resp.text})
-    return (200, resp.json())
+    # Note: cache key includes token string; short ttl keeps it fresh
+    return _get_with_retry(API_RECENTS, _auth_header(access_token), params=params)
 
-def display_now_playing(payload: dict | None):
+def display_now_playing(payload: Dict | None):
     if not payload:
         st.info("Nothing is currently playing on your account.")
         return
@@ -149,7 +189,7 @@ def display_now_playing(payload: dict | None):
             if duration > 0:
                 st.progress(min(1.0, progress / duration))
 
-def display_recent(payload: dict | None):
+def display_recent(payload: Dict | None):
     if not payload:
         return
     items = payload.get("items", [])
@@ -171,21 +211,18 @@ def display_recent(payload: dict | None):
                 st.markdown(f"**{name}**")
                 st.caption(f"{artists} — {album}")
             with cols[2]:
-                # present UTC nicely
                 st.caption(played_at.replace("T", " ").replace("Z", " UTC"))
 
-# --- UI ---
+# ==============================
+# UI
+# ==============================
 st.title("🎧 Live Spotify Data")
 st.caption("Minimal demo: Now Playing + Recent Plays (secure secrets via Streamlit)")
 
-# 🔁 Auto-refresh Now Playing every 10 seconds
-# This refreshes the entire app; cheap endpoints, so acceptable for this MVP.
-st.autorefresh(interval=10_000, key="nowplaying_refresh")
-
-# Sidebar: limit for recents
+# Sidebar controls
 limit = st.sidebar.slider("Recent tracks to show", min_value=1, max_value=50, value=10)
+auto_refresh = st.sidebar.checkbox("Auto-refresh Now Playing (10s)", value=True)
 
-# Secrets status for quick diagnostics
 with st.expander("🔐 Secrets status (local-only)", expanded=False):
     ok_vars = {
         "SPOTIFY_CLIENT_ID": bool(CLIENT_ID),
@@ -194,35 +231,44 @@ with st.expander("🔐 Secrets status (local-only)", expanded=False):
     }
     st.json(ok_vars)
 
+# Ensure redirect URI is present early to avoid loops
 if not REDIRECT_URI:
-    st.error("Missing SPOTIFY_REDIRECT_URI. Set it in .streamlit/secrets.toml (exactly matches your Spotify app Redirect URI).")
+    st.error("Missing SPOTIFY_REDIRECT_URI. Set it in .streamlit/secrets.toml (must exactly match your Spotify app Redirect URI).")
     st.stop()
 
-# OAuth: ensure token present/valid
+# Auth: ensure valid token BEFORE enabling autorefresh to avoid refresh loops on the login screen
 token = ensure_token()
 
 if not token:
     if "oauth_state" not in st.session_state:
         st.session_state["oauth_state"] = hashlib.sha256(os.urandom(32)).hexdigest()
-    auth_link = get_auth_url(st.session_state["oauth_state"])
+    auth_link = _auth_link(st.session_state["oauth_state"])
     st.warning("You need to login with Spotify to continue.")
     st.link_button("🔓 Login with Spotify", auth_link, type="primary")
     st.stop()
 
+# Only start autorefresh once authenticated
+if auto_refresh:
+    st.autorefresh(interval=10_000, key="nowplaying_refresh")
+
 access_token = token["access_token"]
 
-# Fetch & show Now Playing
+# Now Playing
 status_np, payload_np = get_currently_playing(access_token)
 if status_np == 200:
     display_now_playing(payload_np)
 elif status_np == 204:
     st.info("Nothing currently playing.")
 else:
-    st.error(f"Failed to fetch 'Now Playing': {payload_np.get('error', '')}")
+    st.error(f"Failed to fetch 'Now Playing' (status {status_np}).")
+    if isinstance(payload_np, dict) and "error" in payload_np:
+        st.code(payload_np["error"])
 
-# Fetch & show Recent
-status_rc, payload_rc = get_recent_tracks(access_token, limit=limit)
+# Recent (cached for 60s)
+status_rc, payload_rc = get_recent_tracks_cached(access_token, limit=limit)
 if status_rc == 200:
     display_recent(payload_rc)
 else:
-    st.error(f"Failed to fetch 'Recently Played': {payload_rc.get('error', '')}")
+    st.error(f"Failed to fetch 'Recently Played' (status {status_rc}).")
+    if isinstance(payload_rc, dict) and "error" in payload_rc:
+        st.code(payload_rc["error"])
