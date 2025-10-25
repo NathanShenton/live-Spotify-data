@@ -269,13 +269,19 @@ with st.sidebar:
 
     c1, c2 = st.columns(2)
     with c1:
-        if st.button("🔗 Get Spotify Login Link", use_container_width=True):
+        if st.button("🔗 Build Spotify Login Link", use_container_width=True):
             url = build_auth_url()
             if url:
-                # Force SAME-TAB redirect so the session survives
-                components.html(f'<script>window.top.location.href="{url}";</script>', height=0)
+                st.session_state.last_auth_url = url
             else:
                 st.error("Enter Client ID and Redirect URI first.")
+        
+        # Show a native same-tab link button when we have a URL
+        if st.session_state.get("last_auth_url"):
+            st.link_button("Continue to Spotify →", st.session_state.last_auth_url, use_container_width=True)
+            # Optional: plain anchor fallback
+            st.markdown(f'<small>If the button is blocked, <a href="{st.session_state.last_auth_url}">click here</a>.</small>', unsafe_allow_html=True)
+    
     with c2:
         if st.button("🚪 Log out", use_container_width=True):
             for k in [
