@@ -1,10 +1,4 @@
-# app.py — Spotify Now Playing + Mood (PKCE, public-safe)
-# - PKCE (no client secret), Streamlit Cloud-ready
-# - Same-tab auth via st.link_button (no custom JS)
-# - PKCE verifier recovery via OAuth state (csrf.verifier)
-# - Tight 8s network timeouts, smallest album image
-# - Caching for enrichments, lazy OpenAI import
-# - Clear debug + query param visibility
+# app.py — Spotify Now Playing + Mood (PKCE, sticky-state, public-safe)
 
 from typing import Optional
 import os, json, base64, hashlib, secrets
@@ -15,8 +9,8 @@ import requests
 import streamlit as st
 
 # ---------- Fast boot knobs ----------
-REQUEST_TIMEOUT = 8   # seconds for all HTTP calls
-IMG_INDEX = -1        # pick smallest album image
+REQUEST_TIMEOUT = 8   # seconds
+IMG_INDEX = -1        # smallest album image
 
 st.set_page_config(page_title="Spotify Now + Mood (PKCE)", page_icon="🎧", layout="wide")
 
@@ -30,12 +24,12 @@ SCOPES = [
 def _init_state():
     ss = st.session_state
     ss.setdefault("spotify_client_id", "")
-    ss.setdefault("redirect_uri", "")        # must match Spotify app exactly (no trailing slash)
+    ss.setdefault("redirect_uri", "")        # exact app URL, no trailing slash
     ss.setdefault("openai_api_key", "")
 
     # OAuth/PKCE
     ss.setdefault("pkce_code_verifier", None)
-    ss.setdefault("oauth_state_csrf", None)  # CSRF component of state
+    ss.setdefault("oauth_state_csrf", None)
     ss.setdefault("last_auth_url", None)
     ss.setdefault("auth_error", "")
 
@@ -59,23 +53,25 @@ def token_expired() -> bool:
     exp = st.session_state.expires_at
     return (not exp) or (now_utc() >= exp)
 
-def urlsafe_random_bytes(n=64) -> str:
-    # URL-safe base64, strip '='
-    return base64.urlsafe_b64encode(os.urandom(n)).decode().rstrip("=")
+def b64url_encode_bytes(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).decode().rstrip("=")
+
+def b64url_decode_str(s: str) -> bytes:
+    # pad to multiple of 4
+    pad = '=' * (-len(s) % 4)
+    return base64.urlsafe_b64decode(s + pad)
 
 def gen_code_verifier() -> str:
-    # 43..128 chars URL-safe
-    return urlsafe_random_bytes(64)
+    return b64url_encode_bytes(os.urandom(64))
 
 def code_challenge_s256(verifier: str) -> str:
     digest = hashlib.sha256(verifier.encode()).digest()
-    return base64.urlsafe_b64encode(digest).decode().rstrip("=")
+    return b64url_encode_bytes(digest)
 
 def new_csrf_token() -> str:
     return secrets.token_urlsafe(16)
 
 def read_qp_single(name: str) -> Optional[str]:
-    """Return a single query param value across Streamlit versions."""
     try:
         qp = st.query_params  # type: ignore[attr-defined]
         if name in qp:
@@ -98,7 +94,7 @@ def ms_fmt(ms):
     s = ms // 1000
     return f"{s//60}:{s%60:02d}"
 
-# ---------- OAuth (PKCE) ----------
+# ---------- OAuth (PKCE) with sticky state ----------
 def build_auth_url() -> Optional[str]:
     cid = st.session_state.spotify_client_id.strip()
     redir = st.session_state.redirect_uri.strip()
@@ -109,12 +105,16 @@ def build_auth_url() -> Optional[str]:
     challenge = code_challenge_s256(verifier)
     csrf = new_csrf_token()
 
-    # Best-case: keep in session
+    # Save best-case in-session values (works if session survives)
     st.session_state.pkce_code_verifier = verifier
     st.session_state.oauth_state_csrf = csrf
 
-    # Fallback: embed verifier into state (csrf.verifier)
-    state_with_verifier = f"{csrf}.{verifier}"
+    # Sticky payload so we can rebuild session on return even if new session starts
+    payload = {"v": verifier, "cid": cid, "ru": redir}
+    payload_b64 = b64url_encode_bytes(json.dumps(payload).encode("utf-8"))
+
+    # state format: "<csrf>.<payload_b64>"
+    state_full = f"{csrf}.{payload_b64}"
 
     q = {
         "client_id": cid,
@@ -123,7 +123,7 @@ def build_auth_url() -> Optional[str]:
         "scope": " ".join(SCOPES),
         "code_challenge_method": "S256",
         "code_challenge": challenge,
-        "state": state_with_verifier,
+        "state": state_full,
         "show_dialog": "false",
     }
     return f"https://accounts.spotify.com/authorize?{urlencode(q)}"
@@ -134,7 +134,7 @@ def exchange_code_for_token(code: str) -> bool:
         redir = st.session_state.redirect_uri.strip()
         verifier = st.session_state.pkce_code_verifier
         if not (cid and redir and verifier):
-            st.session_state.auth_error = "Missing PKCE verifier. Click ‘Build Spotify Login Link’ again."
+            st.session_state.auth_error = "Missing PKCE verifier or client info. Build login link again."
             return False
 
         token_url = "https://accounts.spotify.com/api/token"
@@ -147,7 +147,7 @@ def exchange_code_for_token(code: str) -> bool:
         }
         r = requests.post(token_url, data=data, timeout=REQUEST_TIMEOUT)
         if r is None or r.status_code != 200:
-            st.session_state.auth_error = f"Token exchange failed: {getattr(r,'status_code', '—')} {getattr(r,'text','')}"
+            st.session_state.auth_error = f"Token exchange failed: {getattr(r,'status_code','—')} {getattr(r,'text','')}"
             return False
 
         tok = r.json()
@@ -300,7 +300,7 @@ with st.sidebar:
         except Exception as e:
             st.write(f"qp error: {e}")
 
-# ---------- Handle OAuth redirect ----------
+# ---------- Handle OAuth redirect (restore from sticky state) ----------
 # Surface Spotify-side redirect errors explicitly
 error_val = read_qp_single("error")
 error_desc = read_qp_single("error_description")
@@ -310,12 +310,24 @@ if error_val:
 code_val = read_qp_single("code")
 state_val = read_qp_single("state")
 
-# Recover PKCE verifier from state if session reset (fallback)
-if state_val and not st.session_state.get("pkce_code_verifier"):
+# Rebuild session from state if needed (handles new tab/new session)
+if state_val:
     if "." in state_val:
-        csrf_part, verifier_part = state_val.split(".", 1)
-        st.session_state.pkce_code_verifier = verifier_part
-        st.session_state.oauth_state_csrf = csrf_part
+        csrf_part, payload_b64 = state_val.split(".", 1)
+        try:
+            payload = json.loads(b64url_decode_str(payload_b64).decode("utf-8"))
+        except Exception:
+            payload = {}
+        # Restore verifier, client id, and redirect uri if missing
+        if not st.session_state.get("pkce_code_verifier") and payload.get("v"):
+            st.session_state.pkce_code_verifier = payload["v"]
+        if not st.session_state.get("spotify_client_id") and payload.get("cid"):
+            st.session_state.spotify_client_id = payload["cid"]
+        if not st.session_state.get("redirect_uri") and payload.get("ru"):
+            st.session_state.redirect_uri = payload["ru"]
+        # Keep csrf for info (optional)
+        if not st.session_state.get("oauth_state_csrf"):
+            st.session_state.oauth_state_csrf = csrf_part
 
 if code_val and not st.session_state.authed:
     ok = exchange_code_for_token(code_val)
@@ -375,7 +387,6 @@ else:
 
 # ---- Recent Tracks & Mood ----
 st.subheader("Recent Tracks & Mood")
-
 n = st.slider("How many recent tracks?", 1, 50, 20, 1)
 
 def load_recent(limit: int):
@@ -420,27 +431,24 @@ if not rows:
 else:
     st.dataframe(
         [
-            {
-                "Played": r["played_at"], "Track": r["track"], "Artists": r["artists"],
-                "Album": r["album"], "Dur": r["dur"], "Pop": r["pop"],
-                "Dance": r["dance"], "Energy": r["energy"], "Valence": r["valence"], "BPM": r["bpm"],
-            } for r in rows
+            {"Played": r["played_at"], "Track": r["track"], "Artists": r["artists"],
+             "Album": r["album"], "Dur": r["dur"], "Pop": r["pop"],
+             "Dance": r["dance"], "Energy": r["energy"], "Valence": r["valence"], "BPM": r["bpm"]}
+            for r in rows
         ],
-        use_container_width=True,
-        hide_index=True,
+        use_container_width=True, hide_index=True,
     )
 
     st.markdown("### 🧠 AI Mood (local only; key stays in your session)")
     extra = st.text_area("Optional context (e.g., 'late-night focus', 'post-gym')", "")
-    model = st.selectbox("OpenAI model", ["gpt-4.1-mini", "gpt-4o-mini", "gpt-4.1", "gpt-3.5-turbo"], index=0)
+    model = st.selectbox("OpenAI model", ["gpt-4.1-mini","gpt-4o-mini","gpt-4.1","gpt-3.5-turbo"], index=0)
 
     if st.button("Analyze Mood", type="primary"):
         if not st.session_state.openai_api_key:
             st.error("Paste your OpenAI API key in the sidebar.")
         else:
             try:
-                # Lazy import for faster cold starts
-                from openai import OpenAI
+                from openai import OpenAI  # lazy import
                 client = OpenAI(api_key=st.session_state.openai_api_key)
             except Exception as e:
                 st.error(f"OpenAI import/init failed: {e}")
@@ -487,4 +495,4 @@ else:
         st.write("_Playlist idea:_ **" + mj.get("suggested_playlist_title", "") + "**")
 
 st.markdown("---")
-st.caption("Public-safe: Spotify PKCE (no client secret), user-supplied OpenAI key, session-only storage. Same-tab auth + PKCE recovery.")
+st.caption("PKCE with sticky OAuth state (verifier + client id + redirect uri). Public-safe, session-only storage.")
