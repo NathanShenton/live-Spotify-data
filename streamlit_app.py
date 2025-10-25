@@ -1,15 +1,14 @@
-# Streamlit + Spotify Now Playing + Recent Mood (Authorization Code flow, secrets in Streamlit)
-# - Uses spotipy's SpotifyOAuth (stable; no PKCE headaches)
-# - Secrets are read from st.secrets (Cloud-side), never in repo
+# Streamlit + Spotify Now Playing + Mood (Auth Code via Spotipy)
+# - Uses ONLY st.query_params (no experimental_* APIs)
+# - Secrets from Streamlit Cloud (no repo secrets)
 # - Tight timeouts, smallest images, caching; lazy OpenAI import
-# - Same-tab authorize via st.link_button; immediate exchange; robust refresh
+# - Same-tab authorize; immediate exchange; robust refresh
 
 from typing import Optional, Dict, Any, List
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import streamlit as st
-import requests
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 
@@ -24,7 +23,7 @@ SCOPES = [
 
 st.set_page_config(page_title="Spotify Now + Mood", page_icon="🎧", layout="wide")
 
-# -------------------- Secrets: must be set in Streamlit Cloud --------------------
+# -------------------- Secrets (Streamlit Cloud) --------------------
 def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
     try:
         return st.secrets[name]  # type: ignore[index]
@@ -38,17 +37,45 @@ REDIRECT_URI = get_secret("SPOTIFY_REDIRECT_URI", "")
 # -------------------- Session init --------------------
 def _init_state():
     ss = st.session_state
-    ss.setdefault("token_info", None)          # spotipy token dict
+    ss.setdefault("token_info", None)   # spotipy token dict
     ss.setdefault("authed", False)
     ss.setdefault("auth_error", "")
     ss.setdefault("openai_api_key", "")
-    ss.setdefault("recent_cache", None)
     ss.setdefault("mood_json", None)
 _init_state()
 
+# -------------------- Helpers --------------------
+def now_ts() -> float:
+    return datetime.now(timezone.utc).timestamp()
+
+def ms_fmt(ms: Optional[int]) -> str:
+    if ms is None:
+        return "-"
+    s = ms // 1000
+    return f"{s//60}:{s%60:02d}"
+
+def masked(s: Optional[str]) -> str:
+    if not s: return "—"
+    return s[:6] + "…" if len(s) > 6 else s
+
+def qp_get(name: str) -> Optional[str]:
+    """Read a single query param using NEW API only."""
+    try:
+        v = st.query_params.get(name)
+        return v[0] if isinstance(v, list) else v
+    except Exception:
+        return None
+
+def qp_clear(*keys: str) -> None:
+    try:
+        for k in keys:
+            if k in st.query_params:
+                del st.query_params[k]
+    except Exception:
+        pass
+
 # -------------------- OAuth via Spotipy --------------------
 def make_oauth() -> SpotifyOAuth:
-    # cache_handler=None: we manage token_info ourselves in session_state
     return SpotifyOAuth(
         client_id=CLIENT_ID,
         client_secret=CLIENT_SECRET,
@@ -57,23 +84,16 @@ def make_oauth() -> SpotifyOAuth:
         cache_path=None,
         show_dialog=False,
         open_browser=False,
+        requests_timeout=REQUEST_TIMEOUT,
     )
-
-def masked(s: Optional[str]) -> str:
-    if not s: return "—"
-    return s[:6] + "…" if len(s) > 6 else s
-
-def now_utc() -> datetime:
-    return datetime.now(timezone.utc)
 
 def ensure_token() -> Optional[str]:
     """Return a valid access_token or None."""
     ti = st.session_state.token_info
     if not ti:
         return None
-    # If expired, refresh
-    expires_at = ti.get("expires_at")
-    if not expires_at or now_utc().timestamp() >= float(expires_at) - 30:
+    expires_at = float(ti.get("expires_at", 0))
+    if now_ts() >= (expires_at - 30):
         try:
             sp_oauth = make_oauth()
             new_ti = sp_oauth.refresh_access_token(ti["refresh_token"])
@@ -88,7 +108,6 @@ def spotify_client() -> Optional[spotipy.Spotify]:
     token = ensure_token()
     if not token:
         return None
-    # spotipy client with request timeouts
     return spotipy.Spotify(auth=token, requests_timeout=REQUEST_TIMEOUT)
 
 # -------------------- Sidebar: Secrets + Login --------------------
@@ -101,33 +120,33 @@ with st.sidebar:
         ok = False
 
     st.markdown("## 🤖 OpenAI (optional)")
-    st.session_state.openai_api_key = st.text_input("OpenAI API Key", type="password", value=st.session_state.openai_api_key)
+    st.session_state.openai_api_key = st.text_input(
+        "OpenAI API Key", type="password", value=st.session_state.openai_api_key
+    )
 
     st.markdown("## 🎫 Login")
     if ok:
-        sp_oauth = make_oauth()
-        auth_url = sp_oauth.get_authorize_url()
-        st.link_button("Continue to Spotify →", auth_url, use_container_width=True)
+        try:
+            sp_oauth = make_oauth()
+            auth_url = sp_oauth.get_authorize_url()
+            st.link_button("Continue to Spotify →", auth_url, use_container_width=True)
+        except Exception as e:
+            st.error(f"OAuth init error: {e}")
 
-        # Parse redirect back (?code=, ?error=)
-        qp = getattr(st, "query_params", None)
-        params = dict(qp) if qp else st.experimental_get_query_params()
-        code = params.get("code", [None])[0] if isinstance(params.get("code"), list) else params.get("code")
-        err  = params.get("error", [None])[0] if isinstance(params.get("error"), list) else params.get("error")
-
+        # --- Handle redirect back using NEW query params API ---
+        err = qp_get("error")
         if err:
             st.error(f"Spotify error: {err}")
 
+        code = qp_get("code")
         if code and not st.session_state.authed:
             try:
                 token_info = sp_oauth.get_access_token(code, as_dict=True)
                 st.session_state.token_info = token_info
                 st.session_state.authed = True
                 st.success("Authenticated with Spotify.")
-                try:
-                    st.experimental_set_query_params()  # clear code from URL
-                except Exception:
-                    pass
+                # Clear params from URL using NEW API
+                qp_clear("code", "state")
             except Exception as e:
                 st.session_state.auth_error = f"Token exchange failed: {e}"
                 st.error(st.session_state.auth_error)
@@ -143,60 +162,21 @@ with st.sidebar:
     st.code(json.dumps(dbg, indent=2))
 
     if st.button("🚪 Log out", use_container_width=True):
-        for k in ["token_info", "authed", "auth_error", "recent_cache", "mood_json"]:
+        for k in ["token_info", "authed", "auth_error", "mood_json"]:
             st.session_state[k] = None
         st.rerun()
 
-# Stop early if not authed
+# -------------------- Early exit if not authed --------------------
 if not st.session_state.authed:
     st.title("🎧 Spotify Now Playing + Mood")
-    st.info("Click **Continue to Spotify →** above, approve, and you’ll be redirected back here.")
+    if not CLIENT_ID or not CLIENT_SECRET or not REDIRECT_URI:
+        st.error("Add your Spotify secrets in Streamlit **Secrets** to proceed.")
+    else:
+        st.info("Click **Continue to Spotify →**, approve, and you’ll be redirected back.")
     st.stop()
 
-# -------------------- Spotify helpers --------------------
-def ms_fmt(ms: Optional[int]) -> str:
-    if ms is None: return "-"
-    s = ms // 1000
-    return f"{s//60}:{s%60:02d}"
-
-@st.cache_data(ttl=120, show_spinner=False)
-def get_audio_features(sp_token: str, track_ids: List[str]) -> Dict[str, Dict[str, Any]]:
-    if not track_ids: return {}
-    sp = spotipy.Spotify(auth=sp_token, requests_timeout=REQUEST_TIMEOUT)
-    ids = [x for x in track_ids if x][:100]
-    feats = sp.audio_features(ids) or []
-    out: Dict[str, Dict[str, Any]] = {}
-    for f in feats:
-        if not f: continue
-        out[f["id"]] = {
-            "danceability": f.get("danceability"),
-            "energy": f.get("energy"),
-            "valence": f.get("valence"),
-            "tempo": f.get("tempo"),
-        }
-    return out
-
-@st.cache_data(ttl=300, show_spinner=False)
-def get_artist_genres(sp_token: str, artist_ids: List[str]) -> List[str]:
-    if not artist_ids: return []
-    sp = spotipy.Spotify(auth=sp_token, requests_timeout=REQUEST_TIMEOUT)
-    ids = list(dict.fromkeys([x for x in artist_ids if x]))[:50]
-    artists = sp.artists(ids).get("artists", [])
-    genres: List[str] = []
-    seen = set()
-    for a in artists:
-        for g in a.get("genres", []):
-            if g not in seen:
-                seen.add(g)
-                genres.append(g)
-            if len(genres) >= 20:
-                return genres
-    return genres
-
-# -------------------- Main UI --------------------
+# -------------------- Main UI (after auth) --------------------
 st.title("🎧 Spotify Now Playing + Mood")
-
-# Only enable autorefresh AFTER we’re authed
 st.caption("Authenticated. Auto-refreshing Now Playing every 10s.")
 st.autorefresh(interval=10_000, key="auto_refresh")
 
@@ -231,9 +211,27 @@ else:
         st.markdown(f"### {item.get('name')}")
         st.markdown("**Artist(s):** " + ", ".join([a["name"] for a in item.get("artists", [])]))
         st.markdown("**Album:** " + item.get("album", {}).get("name", "-"))
+
+        # Audio features (cached)
+        @st.cache_data(ttl=120, show_spinner=False)
+        def _audio_features(token: str, track_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+            cli = spotipy.Spotify(auth=token, requests_timeout=REQUEST_TIMEOUT)
+            ids = [x for x in track_ids if x][:100]
+            feats = cli.audio_features(ids) or []
+            out: Dict[str, Dict[str, Any]] = {}
+            for f in feats:
+                if not f: continue
+                out[f["id"]] = {
+                    "danceability": f.get("danceability"),
+                    "energy": f.get("energy"),
+                    "valence": f.get("valence"),
+                    "tempo": f.get("tempo"),
+                }
+            return out
+
+        tok = ensure_token()
         tid = item.get("id")
-        token = ensure_token()
-        feats = get_audio_features(token, [tid]).get(tid, {}) if (token and tid) else {}
+        feats = _audio_features(tok, [tid]).get(tid, {}) if (tok and tid) else {}
         if feats:
             c = st.columns(4)
             c[0].metric("Danceability", f"{feats.get('danceability', 0):.2f}")
@@ -246,8 +244,9 @@ else:
 st.subheader("Recent Tracks & Mood")
 n = st.slider("How many recent tracks?", 1, 50, 20, 1)
 
-rows = []
+rows: List[Dict[str, Any]] = []
 genres: List[str] = []
+
 try:
     rec = sp.current_user_recently_played(limit=n) or {}
     items = rec.get("items", [])
@@ -266,15 +265,46 @@ try:
             "dur": ms_fmt(t.get("duration_ms")),
             "pop": t.get("popularity"),
         })
-    token = ensure_token()
-    feats = get_audio_features(token, track_ids) if token else {}
-    genres = get_artist_genres(token, artist_ids) if token else []
+
+    @st.cache_data(ttl=120, show_spinner=False)
+    def _features_block(token: str, ids: List[str]) -> Dict[str, Dict[str, Any]]:
+        cli = spotipy.Spotify(auth=token, requests_timeout=REQUEST_TIMEOUT)
+        feats = cli.audio_features([x for x in ids if x][:100]) or []
+        out = {}
+        for f in feats:
+            if not f: continue
+            out[f["id"]] = {
+                "danceability": f.get("danceability"),
+                "energy": f.get("energy"),
+                "valence": f.get("valence"),
+                "tempo": f.get("tempo"),
+            }
+        return out
+
+    @st.cache_data(ttl=300, show_spinner=False)
+    def _genres_block(token: str, artist_ids: List[str]) -> List[str]:
+        cli = spotipy.Spotify(auth=token, requests_timeout=REQUEST_TIMEOUT)
+        ids = list(dict.fromkeys([x for x in artist_ids if x]))[:50]
+        arts = cli.artists(ids).get("artists", [])
+        acc, seen = [], set()
+        for a in arts:
+            for g in a.get("genres", []):
+                if g not in seen:
+                    seen.add(g); acc.append(g)
+                if len(acc) >= 20: return acc
+        return acc
+
+    tok = ensure_token()
+    feats_map = _features_block(tok, track_ids) if (tok and track_ids) else {}
+    genres = _genres_block(tok, artist_ids) if (tok and artist_ids) else []
+
     for r in rows:
-        ft = feats.get(r["track_id"], {})
+        ft = feats_map.get(r["track_id"], {})
         r["Dance"] = round((ft.get("danceability") or 0), 2)
         r["Energy"] = round((ft.get("energy") or 0), 2)
         r["Valence"] = round((ft.get("valence") or 0), 2)
         r["BPM"] = round((ft.get("tempo") or 0))
+
 except spotipy.SpotifyException as e:
     st.error(f"Spotify error: {e}")
 
@@ -301,8 +331,7 @@ else:
             st.error("Paste your OpenAI API key above.")
         else:
             try:
-                # Lazy import for faster cold starts
-                from openai import OpenAI
+                from openai import OpenAI  # lazy import
                 client = OpenAI(api_key=st.session_state.openai_api_key)
             except Exception as e:
                 st.error(f"OpenAI import/init failed: {e}")
@@ -349,4 +378,4 @@ else:
         st.write("_Playlist idea:_ **" + mj.get("suggested_playlist_title", "") + "**")
 
 st.markdown("---")
-st.caption("Authorization Code flow via Spotipy. Secrets live in Streamlit Secrets. Tokens auto-refreshed in-session.")
+st.caption("Authorization Code flow via Spotipy. Only st.query_params used; tokens auto-refreshed in-session.")
