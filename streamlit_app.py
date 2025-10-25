@@ -1,29 +1,22 @@
-# app.py — Spotify Now Playing + Mood (Public-safe PKCE)
-# Streamlit Cloud compatible. No secrets in repo. Uses PKCE (no client secret).
-# Key fixes:
-#  - Same-tab auth redirect to avoid losing Streamlit session.
-#  - Fallback recovery: embeds PKCE code_verifier in OAuth "state" so we can rebuild if session resets.
-#  - Robust query param handling for old/new Streamlit versions.
-#  - Auto-refresh only AFTER auth; clear errors in sidebar Debug panel.
+# app.py — Spotify Now Playing + Mood (PKCE, public-safe)
+# - PKCE (no client secret), Streamlit Cloud-ready
+# - Same-tab auth via st.link_button (no custom JS)
+# - PKCE verifier recovery via OAuth state (csrf.verifier)
+# - Tight 8s network timeouts, smallest album image
+# - Caching for enrichments, lazy OpenAI import
+# - Clear debug + query param visibility
 
-import os
-import json
-import base64
-import hashlib
-import secrets
+from typing import Optional
+import os, json, base64, hashlib, secrets
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
 
 import requests
 import streamlit as st
-import streamlit.components.v1 as components
 
-# Optional: OpenAI (user pastes their own key in the sidebar)
-try:
-    from openai import OpenAI
-    OPENAI_OK = True
-except Exception:
-    OPENAI_OK = False
+# ---------- Fast boot knobs ----------
+REQUEST_TIMEOUT = 8   # seconds for all HTTP calls
+IMG_INDEX = -1        # pick smallest album image
 
 st.set_page_config(page_title="Spotify Now + Mood (PKCE)", page_icon="🎧", layout="wide")
 
@@ -33,10 +26,11 @@ SCOPES = [
     "user-read-recently-played",
 ]
 
+# ---------- Session init ----------
 def _init_state():
     ss = st.session_state
     ss.setdefault("spotify_client_id", "")
-    ss.setdefault("redirect_uri", "")  # must match Spotify app exactly
+    ss.setdefault("redirect_uri", "")        # must match Spotify app exactly (no trailing slash)
     ss.setdefault("openai_api_key", "")
 
     # OAuth/PKCE
@@ -57,8 +51,7 @@ def _init_state():
 
 _init_state()
 
-# -------------------- Helpers --------------------
-
+# ---------- Helpers ----------
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -81,9 +74,8 @@ def code_challenge_s256(verifier: str) -> str:
 def new_csrf_token() -> str:
     return secrets.token_urlsafe(16)
 
-def read_qp_single(name: str):
-    """Return a single query param value regardless of Streamlit version."""
-    # New API
+def read_qp_single(name: str) -> Optional[str]:
+    """Return a single query param value across Streamlit versions."""
     try:
         qp = st.query_params  # type: ignore[attr-defined]
         if name in qp:
@@ -91,7 +83,6 @@ def read_qp_single(name: str):
             return val[0] if isinstance(val, list) else val
     except Exception:
         pass
-    # Legacy API
     try:
         qp = st.experimental_get_query_params()
         if name in qp:
@@ -107,9 +98,8 @@ def ms_fmt(ms):
     s = ms // 1000
     return f"{s//60}:{s%60:02d}"
 
-# -------------------- OAuth (PKCE) --------------------
-
-def build_auth_url() -> str | None:
+# ---------- OAuth (PKCE) ----------
+def build_auth_url() -> Optional[str]:
     cid = st.session_state.spotify_client_id.strip()
     redir = st.session_state.redirect_uri.strip()
     if not cid or not redir:
@@ -119,12 +109,11 @@ def build_auth_url() -> str | None:
     challenge = code_challenge_s256(verifier)
     csrf = new_csrf_token()
 
-    # Save best-case in-session state
+    # Best-case: keep in session
     st.session_state.pkce_code_verifier = verifier
     st.session_state.oauth_state_csrf = csrf
 
-    # Belt-and-braces: embed verifier into state for recovery if session resets
-    # state format: "<csrf>.<verifier>"
+    # Fallback: embed verifier into state (csrf.verifier)
     state_with_verifier = f"{csrf}.{verifier}"
 
     q = {
@@ -140,14 +129,12 @@ def build_auth_url() -> str | None:
     return f"https://accounts.spotify.com/authorize?{urlencode(q)}"
 
 def exchange_code_for_token(code: str) -> bool:
-    """Exchange the authorization code for tokens (PKCE)."""
     try:
         cid = st.session_state.spotify_client_id.strip()
         redir = st.session_state.redirect_uri.strip()
         verifier = st.session_state.pkce_code_verifier
-
         if not (cid and redir and verifier):
-            st.session_state.auth_error = "Missing PKCE verifier. Click ‘Get Spotify Login Link’ again."
+            st.session_state.auth_error = "Missing PKCE verifier. Click ‘Build Spotify Login Link’ again."
             return False
 
         token_url = "https://accounts.spotify.com/api/token"
@@ -158,9 +145,9 @@ def exchange_code_for_token(code: str) -> bool:
             "client_id": cid,
             "code_verifier": verifier,
         }
-        r = requests.post(token_url, data=data, timeout=30)
-        if r.status_code != 200:
-            st.session_state.auth_error = f"Token exchange failed: {r.status_code} {r.text}"
+        r = requests.post(token_url, data=data, timeout=REQUEST_TIMEOUT)
+        if r is None or r.status_code != 200:
+            st.session_state.auth_error = f"Token exchange failed: {getattr(r,'status_code', '—')} {getattr(r,'text','')}"
             return False
 
         tok = r.json()
@@ -170,7 +157,7 @@ def exchange_code_for_token(code: str) -> bool:
         st.session_state.expires_at = now_utc() + timedelta(seconds=expires_in - 30)
         st.session_state.authed = True
 
-        # clear one-time items
+        # clear one-time values
         st.session_state.pkce_code_verifier = None
         st.session_state.oauth_state_csrf = None
         st.session_state.auth_error = ""
@@ -190,9 +177,9 @@ def refresh_access_token() -> bool:
         "refresh_token": rt,
         "client_id": cid,
     }
-    r = requests.post(token_url, data=data, timeout=30)
-    if r.status_code != 200:
-        st.session_state.auth_error = f"Refresh failed: {r.status_code} {r.text}"
+    r = requests.post(token_url, data=data, timeout=REQUEST_TIMEOUT)
+    if r is None or r.status_code != 200:
+        st.session_state.auth_error = f"Refresh failed: {getattr(r,'status_code','—')} {getattr(r,'text','')}"
         return False
     tok = r.json()
     st.session_state.access_token = tok.get("access_token")
@@ -211,58 +198,59 @@ def spotify_get(path: str, params=None):
         return None
     url = f"https://api.spotify.com/v1/{path.lstrip('/')}"
     headers = {"Authorization": f"Bearer {st.session_state.access_token}"}
-    r = requests.get(url, headers=headers, params=params or {}, timeout=30)
+    r = requests.get(url, headers=headers, params=params or {}, timeout=REQUEST_TIMEOUT)
     if r.status_code == 401 and refresh_access_token():
         headers = {"Authorization": f"Bearer {st.session_state.access_token}"}
-        r = requests.get(url, headers=headers, params=params or {}, timeout=30)
+        r = requests.get(url, headers=headers, params=params or {}, timeout=REQUEST_TIMEOUT)
     if r.status_code >= 400:
         st.session_state.auth_error = f"Spotify API error {r.status_code}: {r.text}"
         return None
     return r.json()
 
-# -------------------- Feature helpers --------------------
+# ---------- Cached enrichments ----------
+@st.cache_data(ttl=120, show_spinner=False)
+def _audio_features_csv(ids_csv: str):
+    return spotify_get("audio-features", params={"ids": ids_csv}) or {}
 
 def get_audio_features(track_ids):
     if not track_ids:
         return {}
-    data = spotify_get("audio-features", params={"ids": ",".join(track_ids[:100])})
+    data = _audio_features_csv(",".join(track_ids[:100]))
     out = {}
-    if data and "audio_features" in data:
-        for f in data["audio_features"] or []:
-            if f:
-                out[f["id"]] = {
-                    "danceability": f.get("danceability"),
-                    "energy": f.get("energy"),
-                    "valence": f.get("valence"),
-                    "tempo": f.get("tempo"),
-                }
+    for f in (data.get("audio_features") or []):
+        if f:
+            out[f["id"]] = {
+                "danceability": f.get("danceability"),
+                "energy": f.get("energy"),
+                "valence": f.get("valence"),
+                "tempo": f.get("tempo"),
+            }
     return out
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _artists_csv(ids_csv: str):
+    return spotify_get("artists", params={"ids": ids_csv}) or {}
 
 def get_artist_genres(artist_ids):
     if not artist_ids:
         return []
-    data = spotify_get("artists", params={"ids": ",".join(artist_ids[:50])})
+    data = _artists_csv(",".join(artist_ids[:50]))
     genres = []
-    if data and "artists" in data:
-        for a in data["artists"]:
-            genres.extend(a.get("genres", []))
-    # dedupe preserve order
+    for a in (data.get("artists") or []):
+        genres.extend(a.get("genres", []))
     seen, out = set(), []
     for g in genres:
         if g not in seen:
-            seen.add(g)
-            out.append(g)
-        if len(out) >= 20:
-            break
+            seen.add(g); out.append(g)
+        if len(out) >= 20: break
     return out
 
-# -------------------- Sidebar --------------------
-
+# ---------- Sidebar ----------
 with st.sidebar:
     st.markdown("## 🔐 Credentials (session-only)")
     st.session_state.spotify_client_id = st.text_input("Spotify Client ID", value=st.session_state.spotify_client_id)
     st.session_state.redirect_uri = st.text_input(
-        "Redirect URI (must match Spotify app exactly)",
+        "Redirect URI (must match Spotify app exactly, no trailing slash)",
         value=st.session_state.redirect_uri or "https://<your-app>.streamlit.app",
     )
     st.session_state.openai_api_key = st.text_input("OpenAI API Key (optional, user-provided)", type="password")
@@ -275,19 +263,19 @@ with st.sidebar:
                 st.session_state.last_auth_url = url
             else:
                 st.error("Enter Client ID and Redirect URI first.")
-        
-        # Show a native same-tab link button when we have a URL
         if st.session_state.get("last_auth_url"):
             st.link_button("Continue to Spotify →", st.session_state.last_auth_url, use_container_width=True)
-            # Optional: plain anchor fallback
-            st.markdown(f'<small>If the button is blocked, <a href="{st.session_state.last_auth_url}">click here</a>.</small>', unsafe_allow_html=True)
-    
+            st.markdown(
+                f'<small>If the button is blocked, <a href="{st.session_state.last_auth_url}">click here</a>.</small>',
+                unsafe_allow_html=True
+            )
+
     with c2:
         if st.button("🚪 Log out", use_container_width=True):
             for k in [
-                "access_token", "refresh_token", "expires_at", "authed",
-                "pkce_code_verifier", "oauth_state_csrf", "auth_error",
-                "recent_cache", "mood_json", "last_auth_url"
+                "access_token","refresh_token","expires_at","authed",
+                "pkce_code_verifier","oauth_state_csrf","auth_error",
+                "recent_cache","mood_json","last_auth_url"
             ]:
                 st.session_state[k] = None
             st.rerun()
@@ -302,14 +290,28 @@ with st.sidebar:
         }
         st.code(json.dumps(dbg, indent=2))
 
-# -------------------- Handle OAuth redirect --------------------
+    with st.expander("🌐 Incoming query params"):
+        try:
+            qp_new = getattr(st, "query_params", None)
+            if qp_new:
+                st.write(dict(qp_new))
+            else:
+                st.write(st.experimental_get_query_params())
+        except Exception as e:
+            st.write(f"qp error: {e}")
+
+# ---------- Handle OAuth redirect ----------
+# Surface Spotify-side redirect errors explicitly
+error_val = read_qp_single("error")
+error_desc = read_qp_single("error_description")
+if error_val:
+    st.error(f"Spotify returned error: {error_val} - {error_desc or ''}".strip())
 
 code_val = read_qp_single("code")
 state_val = read_qp_single("state")
 
 # Recover PKCE verifier from state if session reset (fallback)
 if state_val and not st.session_state.get("pkce_code_verifier"):
-    # Expect: "<csrf>.<verifier>"
     if "." in state_val:
         csrf_part, verifier_part = state_val.split(".", 1)
         st.session_state.pkce_code_verifier = verifier_part
@@ -326,8 +328,7 @@ if code_val and not st.session_state.authed:
     else:
         st.error(st.session_state.auth_error or "Authentication failed.")
 
-# -------------------- Main UI --------------------
-
+# ---------- Main UI ----------
 st.title("🎧 Spotify Now Playing + Mood (PKCE, public-safe)")
 
 # Only enable autorefresh AFTER we’re authed and have rendered once
@@ -336,19 +337,20 @@ if st.session_state.authed:
     st.autorefresh(interval=10_000, key="auto_refresh_key")
 
 if not st.session_state.authed:
-    st.info("Paste Client ID + Redirect URI → Get Spotify Login Link → authorize. No client secret needed (PKCE).")
+    st.info("Paste Client ID + Redirect URI → Build Spotify Login Link → authorize. No client secret needed (PKCE).")
     if st.session_state.auth_error:
         st.error(st.session_state.auth_error)
     st.stop()
 
-# -------- Now Playing --------
+# ---- Now Playing ----
 st.subheader("Now Playing")
 now_playing = spotify_get("me/player/currently-playing", params={"additional_types": "track"})
 if not now_playing or now_playing.get("item") is None:
     st.write("Nothing is currently playing.")
 else:
     item = now_playing["item"]
-    img = (item.get("album", {}).get("images") or [{}])[0].get("url")
+    images = (item.get("album", {}).get("images") or [])
+    img = images[IMG_INDEX]["url"] if images else None
     l, r = st.columns([1, 2])
     with l:
         if img:
@@ -371,7 +373,7 @@ else:
             c[3].metric("Tempo", f"{feats.get('tempo', 0):.0f} BPM")
             st.caption("Valence ≈ positivity; Danceability/Energy are Spotify audio features.")
 
-# -------- Recent Tracks & Mood --------
+# ---- Recent Tracks & Mood ----
 st.subheader("Recent Tracks & Mood")
 
 n = st.slider("How many recent tracks?", 1, 50, 20, 1)
@@ -383,15 +385,14 @@ def load_recent(limit: int):
     rows, tids, aids = [], [], []
     for it in data["items"]:
         t = it.get("track", {})
-        if not t:
-            continue
+        if not t: continue
         tids.append(t.get("id"))
-        aids.extend([a.get("id") for a in t.get("artists", []) if a.get("id")])
+        aids.extend([a.get("id") for a in t.get("artists", [])] if t.get("artists") else [])
         rows.append({
             "played_at": it.get("played_at"),
             "track_id": t.get("id"),
             "track": t.get("name"),
-            "artists": ", ".join([a.get("name", "") for a in t.get("artists", [])]),
+            "artists": ", ".join([a.get("name","") for a in t.get("artists", [])]),
             "album": t.get("album", {}).get("name"),
             "dur": ms_fmt(t.get("duration_ms")),
             "pop": t.get("popularity"),
@@ -434,20 +435,24 @@ else:
     model = st.selectbox("OpenAI model", ["gpt-4.1-mini", "gpt-4o-mini", "gpt-4.1", "gpt-3.5-turbo"], index=0)
 
     if st.button("Analyze Mood", type="primary"):
-        if not OPENAI_OK:
-            st.error("OpenAI SDK not installed. Add `openai>=1.14.0` to requirements.txt.")
-        elif not st.session_state.openai_api_key:
+        if not st.session_state.openai_api_key:
             st.error("Paste your OpenAI API key in the sidebar.")
         else:
-            client = OpenAI(api_key=st.session_state.openai_api_key)
+            try:
+                # Lazy import for faster cold starts
+                from openai import OpenAI
+                client = OpenAI(api_key=st.session_state.openai_api_key)
+            except Exception as e:
+                st.error(f"OpenAI import/init failed: {e}")
+                st.stop()
+
             compact = [
-                {
-                    "track": r["track"], "artists": r["artists"], "pop": r["pop"],
-                    "dance": r["dance"], "energy": r["energy"], "valence": r["valence"], "bpm": r["bpm"]
-                } for r in rows
+                {"track": r["track"], "artists": r["artists"], "pop": r["pop"],
+                 "dance": r["dance"], "energy": r["energy"], "valence": r["valence"], "bpm": r["bpm"]}
+                for r in rows
             ]
-            sys = ("You are an expert music psychologist. Infer mood and energy from Spotify audio features "
-                   "(valence/energy/danceability/tempo) and genres. Be precise and practical.")
+            sys_msg = ("You are an expert music psychologist. Infer mood and energy from Spotify audio features "
+                       "(valence/energy/danceability/tempo) and genres. Be precise and practical.")
             schema = ("Return strict JSON: {mood:str, energy_level:'low'|'medium'|'high', confidence:0..1, "
                       "tags:[3..7 strings], one_sentence_summary:str, suggested_action:str, suggested_playlist_title:str}")
 
@@ -455,7 +460,7 @@ else:
                 resp = client.chat.completions.create(
                     model=model,
                     messages=[
-                        {"role": "system", "content": sys},
+                        {"role": "system", "content": sys_msg},
                         {"role": "user", "content": schema},
                         {"role": "user", "content": json.dumps({"genres": genres, "tracks": compact, "notes": extra})},
                     ],
