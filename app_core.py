@@ -1,4 +1,4 @@
-# app_core.py main
+# app_core.py
 import os
 import time
 import base64
@@ -100,8 +100,10 @@ def _refresh_access_token(client_id: str, client_secret: str, refresh_token: str
 
 def ensure_token(cfg: Dict[str, str]) -> Optional[Dict]:
     tok = st.session_state.get("spotify_token")
+    # still valid?
     if tok and int(time.time()) < tok.get("expires_at", 0):
         return tok
+    # try refresh
     if tok and tok.get("refresh_token"):
         try:
             new_tok = _refresh_access_token(cfg["CLIENT_ID"], cfg["CLIENT_SECRET"], tok["refresh_token"])
@@ -111,6 +113,7 @@ def ensure_token(cfg: Dict[str, str]) -> Optional[Dict]:
             st.warning("Token refresh failed. Please re-authenticate.")
             st.session_state.pop("spotify_token", None)
 
+    # try auth code
     code = st.query_params.get("code")
     if code:
         expected = st.session_state.get("oauth_state")
@@ -133,19 +136,48 @@ def _auth_header(access_token: str) -> Dict[str, str]:
     return {"Authorization": f"Bearer {access_token}"}
 
 def _get_with_retry(url: str, headers: Dict[str, str], params: Dict = None) -> Tuple[int, Dict | None]:
+    """
+    GET with small retry budget + 401 refresh once.
+    Returns: (status_code, payload or {"error": ...} or None for 204)
+    """
     params = params or {}
     last_err = None
+    did_refresh = False
     for attempt in range(MAX_RETRIES + 1):
         try:
             resp = _http(APP_VERSION).get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
+            # No content
             if resp.status_code == 204:
                 return 204, None
+            # OK
             if resp.status_code == 200:
                 return 200, resp.json()
-            last_err = resp.text
+            # Unauthorized → try refresh once if we can
+            if resp.status_code == 401 and not did_refresh:
+                tok = st.session_state.get("spotify_token") or {}
+                rtok = tok.get("refresh_token")
+                cfg = _get_config()
+                if rtok:
+                    try:
+                        new_tok = _refresh_access_token(cfg["CLIENT_ID"], cfg["CLIENT_SECRET"], rtok)
+                        st.session_state["spotify_token"] = new_tok
+                        headers = _auth_header(new_tok["access_token"])
+                        did_refresh = True
+                        continue  # retry immediately
+                    except Exception as e:
+                        return 401, {"error": f"Unauthorized and refresh failed: {e}"}
+                return 401, {"error": "Unauthorized"}
+            # Server/transient → small backoff then retry
+            if resp.status_code >= 500:
+                last_err = resp.text
+                time.sleep(0.25 * (attempt + 1))
+                continue
+            # Other client errors
+            return resp.status_code, {"error": resp.text}
         except Exception as e:
             last_err = str(e)
-        time.sleep(0.25 * (attempt + 1))
+            time.sleep(0.2 * (attempt + 1))
+            continue
     return 599, {"error": last_err or "Unknown error"}
 
 # --------------------------
@@ -191,11 +223,20 @@ def _meta_chips(item: Dict) -> str:
 # ------------
 @st.cache_data(ttl=120, show_spinner=False)
 def get_audio_features_batch(access_token: str, track_ids: List[str], version_salt: str) -> Dict[str, Dict]:
-    """Return dict id -> features for up to 100 IDs via /audio-features?ids=..."""
+    """
+    Return dict id -> features for up to 100 IDs via /audio-features?ids=...
+    - Skips empty/duplicate IDs
+    - Tolerates None entries in Spotify's response list
+    """
     result: Dict[str, Dict] = {}
-    ids = [tid for tid in track_ids if tid]
+    # Clean IDs
+    ids = [tid for tid in (track_ids or []) if tid]
     if not ids:
         return result
+    # De-dup to avoid bloating cache/API
+    seen = set()
+    ids = [i for i in ids if not (i in seen or seen.add(i))]
+    # Chunk by 100
     for i in range(0, len(ids), 100):
         chunk = ids[i:i+100]
         params = {"ids": ",".join(chunk)}
@@ -204,6 +245,7 @@ def get_audio_features_batch(access_token: str, track_ids: List[str], version_sa
             for f in payload.get("audio_features", []) or []:
                 if f and f.get("id"):
                     result[f["id"]] = f
+        # If non-200, just skip this chunk (avoid breaking UI)
     return result
 
 def feature_badges(feat: Dict) -> str:
@@ -271,9 +313,9 @@ Return in this structure:
     except Exception as e:
         return f"OpenAI request failed: {e}"
 
-# ------------
-# UI builders
-# ------------
+# --------------------------
+# UI helpers
+# --------------------------
 def _now_playing(access_token: str):
     code, payload = _get_with_retry(API_ME_PLAYER, _auth_header(access_token))
     if code == 204:
@@ -343,13 +385,29 @@ def _now_playing(access_token: str):
             st.markdown(md)
 
 def _recent(access_token: str, limit: int):
-    code_rc, payload_rc = _get_with_retry(API_RECENTS, _auth_header(access_token), params={"limit": limit})
+    code_rc, payload_rc = _get_with_retry(API_RECENTS, _auth_header(access_token), params={"limit": max(1, min(limit, 50))})
     if code_rc != 200:
         st.error(f"Failed to fetch 'Recently Played' (status {code_rc}).")
+        if isinstance(payload_rc, dict) and payload_rc.get("error"):
+            st.code(payload_rc["error"])
         return
-    items = payload_rc.get("items", [])
-    ids = [(it.get("track") or {}).get("id") for it in items]
-    feats_map = get_audio_features_batch(st.session_state["spotify_token"]["access_token"], ids, version_salt=APP_VERSION)
+
+    items = payload_rc.get("items", []) or []
+    # Collect track IDs (skip any None / local tracks)
+    ids = []
+    for it in items:
+        tr = it.get("track") or {}
+        tid = tr.get("id")
+        if tid:
+            ids.append(tid)
+
+    feats_map: Dict[str, Dict] = {}
+    if ids:
+        feats_map = get_audio_features_batch(
+            st.session_state["spotify_token"]["access_token"],
+            ids,
+            version_salt=APP_VERSION
+        )
 
     st.markdown("### ⏮️ Recently Played")
     for it in items:
@@ -369,6 +427,9 @@ def _recent(access_token: str, limit: int):
         tid = tr.get("id")
         if tid and tid in feats_map:
             st.markdown(feature_badges(feats_map[tid]), unsafe_allow_html=True)
+        else:
+            # No features (local track / unavailable / API miss) — don't fail
+            pass
 
 # ------------
 # Main entry
