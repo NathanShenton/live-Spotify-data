@@ -1,8 +1,9 @@
-# Streamlit + Spotify Now Playing + Mood (Auth Code via Spotipy)
-# - Only st.query_params (no experimental_* APIs)
-# - Secrets from Streamlit Cloud (no repo secrets)
-# - Tight timeouts, smallest images, caching; lazy OpenAI import
-# - Same-tab authorize; immediate exchange; robust refresh via JS
+# Streamlit + Spotify Now Playing + Mood (robust, loop-safe)
+# - Only st.query_params (no experimental APIs)
+# - Boot sanitizes query params to avoid poisoned sessions
+# - Auto-refresh OFF by default; only enables after healthy render
+# - Refresh preserves refresh_token
+# - Force Re-Auth & Hard Reset utilities
 
 from typing import Optional, Dict, Any, List
 import json
@@ -13,8 +14,8 @@ import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 
 # -------------------- App constants --------------------
-REQUEST_TIMEOUT = 8           # seconds
-IMG_INDEX = -1                # use smallest album image
+REQUEST_TIMEOUT = 8
+IMG_INDEX = -1
 SCOPES = [
     "user-read-playback-state",
     "user-read-currently-playing",
@@ -23,50 +24,12 @@ SCOPES = [
 
 st.set_page_config(page_title="Spotify Now + Mood", page_icon="🎧", layout="wide")
 
-# -------------------- Auto-refresh (JS) --------------------
-def enable_auto_refresh(seconds: int = 10):
-    st.markdown(
-        f"""
-        <script>
-        setTimeout(function() {{
-            const url = new URL(window.location);
-            url.searchParams.set('_ts', Date.now().toString()); // bust cache, trigger rerun
-            window.location.replace(url);
-        }}, {int(seconds*1000)});
-        </script>
-        """,
-        unsafe_allow_html=True,
-    )
-
-# -------------------- Secrets (Streamlit Cloud) --------------------
-def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
-    try:
-        return st.secrets[name]  # type: ignore[index]
-    except Exception:
-        return default
-
-CLIENT_ID = get_secret("SPOTIFY_CLIENT_ID", "")
-CLIENT_SECRET = get_secret("SPOTIFY_CLIENT_SECRET", "")
-REDIRECT_URI = get_secret("SPOTIFY_REDIRECT_URI", "")  # must match Spotify app exactly
-
-# -------------------- Session init --------------------
-def _init_state():
-    ss = st.session_state
-    ss.setdefault("token_info", None)   # spotipy token dict
-    ss.setdefault("authed", False)
-    ss.setdefault("auth_error", "")
-    ss.setdefault("openai_api_key", "")
-    ss.setdefault("mood_json", None)
-    ss.setdefault("auto_refresh_on", True)
-_init_state()
-
-# -------------------- Helpers --------------------
+# -------------------- Utilities --------------------
 def now_ts() -> float:
     return datetime.now(timezone.utc).timestamp()
 
 def ms_fmt(ms: Optional[int]) -> str:
-    if ms is None:
-        return "-"
+    if ms is None: return "-"
     s = ms // 1000
     return f"{s//60}:{s%60:02d}"
 
@@ -75,7 +38,6 @@ def masked(s: Optional[str]) -> str:
     return s[:6] + "…" if len(s) > 6 else s
 
 def qp_get(name: str) -> Optional[str]:
-    """Read a single query param using NEW API only."""
     try:
         v = st.query_params.get(name)
         return v[0] if isinstance(v, list) else v
@@ -90,7 +52,72 @@ def qp_clear(*keys: str) -> None:
     except Exception:
         pass
 
-# -------------------- OAuth via Spotipy --------------------
+def js_hard_reset():
+    st.markdown(
+        """
+        <script>
+        try {
+          localStorage.clear(); sessionStorage.clear();
+          const url = new URL(window.location);
+          url.search = '';  // drop all query params
+          window.location.replace(url);
+        } catch(e) {}
+        </script>
+        """,
+        unsafe_allow_html=True,
+    )
+
+def enable_auto_refresh(seconds: int = 10):
+    st.markdown(
+        f"""
+        <script>
+        setTimeout(function() {{
+            try {{
+              const url = new URL(window.location);
+              // Only add _ts if not currently doing OAuth exchange
+              url.searchParams.delete('code');
+              url.searchParams.delete('state');
+              url.searchParams.set('_ts', Date.now().toString());
+              window.location.replace(url);
+            }} catch(e) {{}}
+        }}, {int(seconds*1000)});
+        </script>
+        """,
+        unsafe_allow_html=True,
+    )
+
+# -------------------- Secrets --------------------
+def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
+    try:
+        return st.secrets[name]  # type: ignore[index]
+    except Exception:
+        return default
+
+CLIENT_ID = get_secret("SPOTIFY_CLIENT_ID", "")
+CLIENT_SECRET = get_secret("SPOTIFY_CLIENT_SECRET", "")
+REDIRECT_URI = get_secret("SPOTIFY_REDIRECT_URI", "")
+
+# -------------------- Session --------------------
+def _init_state():
+    ss = st.session_state
+    ss.setdefault("token_info", None)     # spotipy token dict
+    ss.setdefault("authed", False)
+    ss.setdefault("auth_error", "")
+    ss.setdefault("openai_api_key", "")
+    ss.setdefault("mood_json", None)
+    ss.setdefault("auto_refresh_on", False)  # start OFF
+    ss.setdefault("boot_sanitized", False)   # ensure we clear params exactly once per session
+_init_state()
+
+# -------------------- Boot sanitization --------------------
+# If a previous crash left ?code/state/_ts in the URL, clear them ONCE before anything else
+if not st.session_state.boot_sanitized:
+    # If user is already authed, drop any leftover oauth params immediately
+    if st.session_state.authed:
+        qp_clear("code", "state", "_ts")
+    st.session_state.boot_sanitized = True
+
+# -------------------- OAuth helpers --------------------
 def make_oauth() -> SpotifyOAuth:
     return SpotifyOAuth(
         client_id=CLIENT_ID,
@@ -103,22 +130,43 @@ def make_oauth() -> SpotifyOAuth:
         requests_timeout=REQUEST_TIMEOUT,
     )
 
+def _merge_token_info(old_ti: dict | None, new_ti: dict) -> dict:
+    # Spotify often omits refresh_token; preserve old one
+    if old_ti and not new_ti.get("refresh_token"):
+        new_ti["refresh_token"] = old_ti.get("refresh_token")
+    # normalize expires_at
+    if "expires_at" in new_ti:
+        try:
+            new_ti["expires_at"] = float(new_ti["expires_at"])
+        except Exception:
+            pass
+    return new_ti
+
 def ensure_token() -> Optional[str]:
-    """Return a valid access_token or None."""
+    """Return a valid access_token, refreshing if needed; preserves refresh_token."""
     ti = st.session_state.token_info
     if not ti:
         return None
-    expires_at = float(ti.get("expires_at", 0))
-    if now_ts() >= (expires_at - 30):
-        try:
-            sp_oauth = make_oauth()
-            new_ti = sp_oauth.refresh_access_token(ti["refresh_token"])
-            st.session_state.token_info = new_ti
-            return new_ti.get("access_token")
-        except Exception as e:
-            st.session_state.auth_error = f"Refresh failed: {e}"
+    try:
+        expires_at = float(ti.get("expires_at", 0))
+    except Exception:
+        expires_at = 0.0
+
+    if now_ts() < (expires_at - 30):
+        return ti.get("access_token")
+
+    try:
+        sp_oauth = make_oauth()
+        rt = ti.get("refresh_token")
+        if not rt:
+            st.session_state.auth_error = "Missing refresh token; please log in again."
             return None
-    return ti.get("access_token")
+        new_ti = sp_oauth.refresh_access_token(rt)
+        st.session_state.token_info = _merge_token_info(ti, new_ti)
+        return st.session_state.token_info.get("access_token")
+    except Exception as e:
+        st.session_state.auth_error = f"Refresh failed: {e}"
+        return None
 
 def spotify_client() -> Optional[spotipy.Spotify]:
     token = ensure_token()
@@ -126,7 +174,7 @@ def spotify_client() -> Optional[spotipy.Spotify]:
         return None
     return spotipy.Spotify(auth=token, requests_timeout=REQUEST_TIMEOUT)
 
-# -------------------- Sidebar: Secrets + Login --------------------
+# -------------------- Sidebar --------------------
 with st.sidebar:
     st.markdown("## 🔐 Secrets")
     ok = True
@@ -140,7 +188,7 @@ with st.sidebar:
         "OpenAI API Key", type="password", value=st.session_state.openai_api_key
     )
 
-    st.markdown("## ⚙️ Auto-refresh")
+    st.markdown("## ⚙️ Controls")
     st.session_state.auto_refresh_on = st.toggle("Auto-refresh every 10s", value=st.session_state.auto_refresh_on)
 
     st.markdown("## 🎫 Login")
@@ -152,7 +200,7 @@ with st.sidebar:
         except Exception as e:
             st.error(f"OAuth init error: {e}")
 
-        # --- Handle redirect back using NEW query params API ---
+        # Handle redirect (new query params API only)
         err = qp_get("error")
         if err:
             st.error(f"Spotify error: {err}")
@@ -161,11 +209,11 @@ with st.sidebar:
         if code and not st.session_state.authed:
             try:
                 token_info = sp_oauth.get_access_token(code, as_dict=True)
-                st.session_state.token_info = token_info
+                st.session_state.token_info = _merge_token_info(st.session_state.token_info, token_info)
                 st.session_state.authed = True
                 st.success("Authenticated with Spotify.")
-                # Clear params from URL using NEW API
                 qp_clear("code", "state", "_ts")
+                # We only enable auto-refresh after successful first render (see below)
             except Exception as e:
                 st.session_state.auth_error = f"Token exchange failed: {e}"
                 st.error(st.session_state.auth_error)
@@ -177,12 +225,32 @@ with st.sidebar:
         "client_id": masked(CLIENT_ID),
         "redirect_uri": REDIRECT_URI or "—",
         "auth_error": st.session_state.auth_error or "—",
+        "boot_sanitized": st.session_state.boot_sanitized,
+        "auto_refresh_on": st.session_state.auto_refresh_on,
+        "has_code_param": bool(qp_get("code")),
+        "has_state_param": bool(qp_get("state")),
+        "has__ts_param": bool(qp_get("_ts")),
     }
     st.code(json.dumps(dbg, indent=2))
 
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("🔁 Force re-auth", use_container_width=True):
+            st.session_state["token_info"] = None
+            st.session_state["authed"] = False
+            qp_clear("code", "state", "_ts")
+            st.rerun()
+    with c2:
+        if st.button("🧹 Hard reset (clear URL & storage)", use_container_width=True):
+            # Clear server-side session, then run JS to clear browser storage & URL
+            for k in list(st.session_state.keys()):
+                del st.session_state[k]
+            js_hard_reset()
+
     if st.button("🚪 Log out", use_container_width=True):
-        for k in ["token_info", "authed", "auth_error", "mood_json"]:
+        for k in ["token_info", "authed", "auth_error", "mood_json", "auto_refresh_on"]:
             st.session_state[k] = None
+        qp_clear("code", "state", "_ts")
         st.rerun()
 
 # -------------------- Early exit if not authed --------------------
@@ -194,17 +262,14 @@ if not st.session_state.authed:
         st.info("Click **Continue to Spotify →**, approve, and you’ll be redirected back.")
     st.stop()
 
-# -------------------- Main UI (after auth) --------------------
+# -------------------- Main UI --------------------
 st.title("🎧 Spotify Now Playing + Mood")
-if st.session_state.auto_refresh_on:
-    st.caption("Auto-refreshing Now Playing every 10s.")
-    enable_auto_refresh(10)
-else:
-    st.caption("Auto-refresh is OFF.")
 
 sp = spotify_client()
 if not sp:
     st.error(st.session_state.auth_error or "Missing/expired token.")
+    # Safety: if we fail here, don't keep refreshing this broken state
+    st.session_state.auto_refresh_on = False
     st.stop()
 
 # ---- Now Playing ----
@@ -213,6 +278,7 @@ try:
     np = sp.current_user_playing_track()
 except spotipy.SpotifyException as e:
     st.error(f"Spotify error: {e}")
+    st.session_state.auto_refresh_on = False
     np = None
 
 if not np or np.get("item") is None:
@@ -234,7 +300,6 @@ else:
         st.markdown("**Artist(s):** " + ", ".join([a["name"] for a in item.get("artists", [])]))
         st.markdown("**Album:** " + item.get("album", {}).get("name", "-"))
 
-        # Audio features (cached)
         @st.cache_data(ttl=120, show_spinner=False)
         def _audio_features(token: str, track_ids: List[str]) -> Dict[str, Dict[str, Any]]:
             cli = spotipy.Spotify(auth=token, requests_timeout=REQUEST_TIMEOUT)
@@ -329,17 +394,17 @@ try:
 
 except spotipy.SpotifyException as e:
     st.error(f"Spotify error: {e}")
+    st.session_state.auto_refresh_on = False
 
 if not rows:
     st.warning("No recent tracks found.")
 else:
     st.dataframe(
         [
-            {
-                "Played": r["played_at"], "Track": r["track"], "Artists": r["artists"],
-                "Album": r["album"], "Dur": r["dur"], "Pop": r["pop"],
-                "Dance": r["Dance"], "Energy": r["Energy"], "Valence": r["Valence"], "BPM": r["BPM"],
-            } for r in rows
+            {"Played": r["played_at"], "Track": r["track"], "Artists": r["artists"],
+             "Album": r["album"], "Dur": r["dur"], "Pop": r["pop"],
+             "Dance": r["Dance"], "Energy": r["Energy"], "Valence": r["Valence"], "BPM": r["BPM"]}
+            for r in rows
         ],
         use_container_width=True, hide_index=True,
     )
@@ -353,7 +418,7 @@ else:
             st.error("Paste your OpenAI API key above.")
         else:
             try:
-                from openai import OpenAI  # lazy import
+                from openai import OpenAI
                 client = OpenAI(api_key=st.session_state.openai_api_key)
             except Exception as e:
                 st.error(f"OpenAI import/init failed: {e}")
@@ -399,5 +464,10 @@ else:
         st.write("**Action:** " + mj.get("suggested_action", ""))
         st.write("_Playlist idea:_ **" + mj.get("suggested_playlist_title", "") + "**")
 
+# -------------------- Enable auto-refresh ONLY after a healthy render --------------------
+if st.session_state.auto_refresh_on and st.session_state.authed and not st.session_state.auth_error:
+    # Only attach refresher after page reached bottom without raising errors
+    enable_auto_refresh(10)
+
 st.markdown("---")
-st.caption("Authorization Code flow via Spotipy. Only st.query_params used; tokens auto-refreshed. JS-based auto-refresh for 1.36.")
+st.caption("Loop-safe: URL sanitized, refresh_token preserved, auto-refresh guarded. Use Hard Reset if a session gets stuck.")
