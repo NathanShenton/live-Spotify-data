@@ -148,6 +148,44 @@ def _get_with_retry(url: str, headers: Dict[str, str], params: Dict = None) -> T
         time.sleep(0.25 * (attempt + 1))
     return 599, {"error": last_err or "Unknown error"}
 
+# --------------------------
+# Formatting helpers
+# --------------------------
+def _fmt_ms(ms: int) -> str:
+    """Convert milliseconds to M:SS, floor seconds."""
+    if not ms or ms < 0:
+        return "0:00"
+    s = int(ms // 1000)
+    m, s = divmod(s, 60)
+    return f"{m}:{s:02d}"
+
+def _meta_chips(item: Dict) -> str:
+    """Render compact chips for key track metadata."""
+    album = item.get("album") or {}
+    release = album.get("release_date") or ""
+    year = release[:4] if release else ""
+    popularity = item.get("popularity")
+    explicit = item.get("explicit", False)
+    track_no = item.get("track_number")
+    disc_no = item.get("disc_number")
+
+    chips = []
+    if year:
+        chips.append(f"📆 {year}")
+    if popularity is not None:
+        chips.append(f"⭐ {popularity}")
+    chips.append("⚠️ Explicit" if explicit else "🟢 Clean")
+    if track_no:
+        chips.append(f"🔢 Track {track_no}")
+    if disc_no and disc_no > 1:
+        chips.append(f"💿 Disc {disc_no}")
+
+    html = "<div style='display:flex;gap:.5rem;flex-wrap:wrap;'>"
+    for c in chips:
+        html += f"<span style='padding:.2rem .4rem;border-radius:.5rem;border:1px solid #ddd;'>{c}</span>"
+    html += "</div>"
+    return html
+
 # ------------
 # Audio feats
 # ------------
@@ -161,15 +199,15 @@ def get_audio_features_batch(access_token: str, track_ids: List[str], version_sa
     for i in range(0, len(ids), 100):
         chunk = ids[i:i+100]
         params = {"ids": ",".join(chunk)}
-        status, payload = _get_with_retry(API_AUDIO_FEATURES, _auth_header(access_token), params=params)
-        if status == 200 and isinstance(payload, dict):
+        code, payload = _get_with_retry(API_AUDIO_FEATURES, _auth_header(access_token), params=params)
+        if code == 200 and isinstance(payload, dict):
             for f in payload.get("audio_features", []) or []:
                 if f and f.get("id"):
                     result[f["id"]] = f
     return result
 
 def feature_badges(feat: Dict) -> str:
-    """Render simple HTML badges for a track's key audio features."""
+    """Render simple HTML badges for key audio features."""
     if not feat:
         return ""
     def pct(x):
@@ -179,7 +217,7 @@ def feature_badges(feat: Dict) -> str:
             return 0
     tempo = int(round(feat.get("tempo", 0) or 0))
     energy = pct(feat.get("energy", 0))
-    valence = pct(feat.get("valence", 0))
+    valence = pct(feat.get("valence", 0))  # "happiness"
     dance = pct(feat.get("danceability", 0))
     html = f"""
     <div style='display:flex;gap:.5rem;flex-wrap:wrap;'>
@@ -246,10 +284,15 @@ def _now_playing(access_token: str):
         if isinstance(payload, dict) and payload.get("error"):
             st.code(payload["error"])
         return
+
     item = (payload or {}).get("item") or {}
+    is_playing = bool((payload or {}).get("is_playing"))
+    progress_ms = int((payload or {}).get("progress_ms") or 0)
+    duration_ms = int(item.get("duration_ms") or 0)
+
     artists_txt = ", ".join([a["name"] for a in item.get("artists", [])]) or "Unknown Artist"
     name = item.get("name", "Unknown Track")
-    album = item.get("album", {}).get("name", "Unknown Album")
+    album = (item.get("album") or {}).get("name", "Unknown Album")
     art = (item.get("album", {}).get("images") or [{}])[0].get("url")
 
     with st.container(border=True):
@@ -258,20 +301,40 @@ def _now_playing(access_token: str):
             if art:
                 st.image(art, use_container_width=True)
         with cols[1]:
-            st.markdown(f"### 🎵 {name}")
+            # Title + artist/album
+            live_flag = " • LIVE" if is_playing else " • Paused"
+            st.markdown(f"### 🎵 {name}{live_flag}")
             st.caption(f"{artists_txt} — {album}")
+
+            # Progress bar + timecodes
+            if duration_ms > 0:
+                ratio = max(0.0, min(1.0, progress_ms / duration_ms))
+                st.progress(ratio)
+                st.caption(f"{_fmt_ms(progress_ms)} / {_fmt_ms(duration_ms)}")
+
+            # Metadata chips
+            st.markdown(_meta_chips(item), unsafe_allow_html=True)
+
+            # Audio features badges (mood/energy etc.)
             track_id = item.get("id")
             if track_id:
-                feats = get_audio_features_batch(st.session_state["spotify_token"]["access_token"], [track_id], version_salt=APP_VERSION)
+                feats = get_audio_features_batch(
+                    st.session_state["spotify_token"]["access_token"],
+                    [track_id],
+                    version_salt=APP_VERSION,
+                )
                 f = feats.get(track_id)
                 if f:
                     st.markdown(feature_badges(f), unsafe_allow_html=True)
 
+    # Optional AI panel
     with st.expander("🧠 AI Knowledge (optional)", expanded=False):
         st.caption("Paste your OpenAI API key locally (not stored).")
         if "openai_key" not in st.session_state:
             st.session_state["openai_key"] = ""
-        st.session_state["openai_key"] = st.text_input("OpenAI API Key", type="password", value=st.session_state["openai_key"])
+        st.session_state["openai_key"] = st.text_input(
+            "OpenAI API Key", type="password", value=st.session_state["openai_key"]
+        )
         model = st.selectbox("Model", ["gpt-4.1-mini", "gpt-4o-mini", "gpt-4.1"], index=0)
         custom_model = st.text_input("Custom model (optional)")
         chosen_model = custom_model.strip() or model
