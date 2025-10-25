@@ -50,6 +50,7 @@ AUTH_URL = "https://accounts.spotify.com/authorize"
 TOKEN_URL = "https://accounts.spotify.com/api/token"
 API_ME_PLAYER = "https://api.spotify.com/v1/me/player/currently-playing"
 API_RECENTS = "https://api.spotify.com/v1/me/player/recently-played"
+API_AUDIO_FEATURES = "https://api.spotify.com/v1/audio-features"
 
 REQUEST_TIMEOUT = 8
 MAX_RETRIES = 2
@@ -183,6 +184,49 @@ def get_recent_tracks_cached(access_token: str, limit: int, version_salt: str) -
     params = {"limit": max(1, min(limit, 50))}
     return _get_with_retry(API_RECENTS, _auth_header(access_token), params=params)
 
+
+@st.cache_data(ttl=120, show_spinner=False)
+def get_audio_features_batch(access_token: str, track_ids: list[str], version_salt: str) -> Dict[str, Dict]:
+    \"\"\"Return dict id -> features for up to 100 IDs via /audio-features?ids=...\"\"\"
+    result = {}
+    ids = [tid for tid in track_ids if tid]
+    if not ids:
+        return result
+    # Spotify allows up to 100 IDs per request
+    for i in range(0, len(ids), 100):
+        chunk = ids[i:i+100]
+        params = {"ids": ",".join(chunk)}
+        status, payload = _get_with_retry(API_AUDIO_FEATURES, _auth_header(access_token), params=params)
+        if status == 200 and isinstance(payload, dict):
+            for f in payload.get("audio_features", []) or []:
+                if f and f.get("id"):
+                    result[f["id"]] = f
+    return result
+
+def feature_badges(feat: Dict) -> str:
+    if not feat:
+        return ""
+    def pct(x):
+        try:
+            return int(round(float(x) * 100))
+        except Exception:
+            return 0
+    tempo = int(round(feat.get("tempo", 0) or 0))
+    energy = pct(feat.get("energy", 0))
+    valence = pct(feat.get("valence", 0))  # "happiness"
+    dance = pct(feat.get("danceability", 0))
+    loud = feat.get("loudness", 0)
+    # Simple HTML badges for compact display
+    html = f'''
+    <div style="display:flex;gap:.5rem;flex-wrap:wrap;">
+      <span style="padding:.2rem .4rem;border-radius:.5rem;border:1px solid #ddd;">🔥 Energy: {energy}%</span>
+      <span style="padding:.2rem .4rem;border-radius:.5rem;border:1px solid #ddd;">😊 Valence: {valence}%</span>
+      <span style="padding:.2rem .4rem;border-radius:.5rem;border:1px solid #ddd;">🕺 Dance: {dance}%</span>
+      <span style="padding:.2rem .4rem;border-radius:.5rem;border:1px solid #ddd;">⏱️ Tempo: {tempo} BPM</span>
+    </div>'''
+    return html
+
+
 def display_now_playing(payload: Dict | None):
     if not payload:
         st.info("Nothing is currently playing on your account.")
@@ -215,6 +259,9 @@ def display_recent(payload: Dict | None):
         return
     items = payload.get("items", [])
     st.markdown("### ⏮️ Recently Played")
+    # Batch fetch audio features for all recent tracks
+    ids = [ (it.get('track') or {}).get('id') for it in items ]
+    feats_map = get_audio_features_batch(st.session_state['spotify_token']['access_token'], ids, version_salt=APP_VERSION)
     for it in items:
         track = (it.get("track") or {})
         played_at = it.get("played_at", "")
@@ -233,7 +280,17 @@ def display_recent(payload: Dict | None):
                 st.caption(f"{artists} — {album}")
             with cols[2]:
                 st.caption(played_at.replace("T", " ").replace("Z", " UTC"))
+        # features row
+        tid = track.get('id')
+        if tid and tid in feats_map:
+            st.markdown(feature_badges(feats_map[tid]), unsafe_allow_html=True)
 
+
+# ==============================
+# OpenAI "AI Knowledge" (optional)
+# ==============================
+def ask_openai_about_track(api_key: str, model: str, track: Dict, artists: str) -> str:
+    \"\"\"Call OpenAI with a concise prompt asking for facts and meaning.\n    Returns markdown string.\n    \"\"\"\n    if not api_key:\n        return \"\"\n    headers = {\n        \"Authorization\": f\"Bearer {api_key}\",\n        \"Content-Type\": \"application/json\",\n    }\n    name = track.get(\"name\", \"Unknown Track\")\n    album = (track.get(\"album\") or {}).get(\"name\", \"Unknown Album\")\n    rel = (track.get(\"album\") or {}).get(\"release_date\")\n    artist_names = artists\n    prompt = f\"\"\"\nYou are a music expert. In 120-180 words, answer the following about the song below. If details are uncertain, say so briefly.\n\nSong: {name}\nArtist(s): {artist_names}\nAlbum: {album}\nRelease date (if known): {rel}\n\nReturn in **this exact structure** using concise bullet points:\n- One interesting fact about the song\n- One interesting fact about the artist\n- What the song means (plain-English, no fluff)\n- One similar song and/or artist to try next (1–2 picks, explain why in 1 short sentence)\n\"\"\".strip()\n    body = {\n        \"model\": model,\n        \"messages\": [\n            {\"role\": \"system\", \"content\": \"Be accurate, concise, and avoid speculation. Use UK English.\"},\n            {\"role\": \"user\", \"content\": prompt},\n        ],\n        \"temperature\": 0.3,\n    }\n    try:\n        resp = _http(APP_VERSION).post(\"https://api.openai.com/v1/chat/completions\", headers=headers, json=body, timeout=20)\n        if resp.status_code != 200:\n            return f\"OpenAI error: {resp.status_code} — {resp.text[:300]}\"\n        data = resp.json()\n        text = data.get(\"choices\", [{}])[0].get(\"message\", {}).get(\"content\", \"\")\n        return text or \"No response.\"\n    except Exception as e:\n        return f\"OpenAI request failed: {e}\"\n
 # ==============================
 # UI
 # ==============================
@@ -288,8 +345,24 @@ access_token = token["access_token"]
 status_np, payload_np = get_currently_playing(access_token)
 if status_np == 200:
     display_now_playing(payload_np)
+    # --- AI Knowledge panel (optional) ---
+    with st.expander("🧠 AI Knowledge (optional)", expanded=False):
+        st.caption("Paste your OpenAI API key locally; it is kept only in this session and not stored.")
+        if "openai_key" not in st.session_state:
+            st.session_state["openai_key"] = ""
+        st.session_state["openai_key"] = st.text_input("OpenAI API Key", type="password", value=st.session_state["openai_key"])
+        model = st.selectbox("Model", ["gpt-4.1-mini", "gpt-4o-mini", "gpt-4.1", "o4-mini"], index=0, help="Pick a model you have access to. If you have GPT-5 access, type it below.")
+        custom_model = st.text_input("Custom model name (optional)")
+        chosen_model = custom_model.strip() or model
+        if st.session_state.get('openai_key') and st.button("Get AI Knowledge for current song"):
+            item = payload_np.get('item') or {}
+            artists = ", ".join([a["name"] for a in item.get("artists", [])]) or "Unknown Artist"
+            md = ask_openai_about_track(st.session_state['openai_key'], chosen_model, item, artists)
+            st.markdown(md)
+
 elif status_np == 204:
     st.info("Nothing currently playing.")
+
 else:
     st.error(f"Failed to fetch 'Now Playing' (status {status_np}).")
     if isinstance(payload_np, dict) and "error" in payload_np:
@@ -299,6 +372,30 @@ else:
 status_rc, payload_rc = get_recent_tracks_cached(access_token, limit=limit, version_salt=APP_VERSION)
 if status_rc == 200:
     display_recent(payload_rc)
+    with st.expander("🧠 AI Knowledge (from a recent track)", expanded=False):
+        if payload_rc and payload_rc.get('items'):
+            options = []
+            id_map = {}
+            for it in payload_rc['items']:
+                tr = (it.get('track') or {})
+                tid = tr.get('id')
+                name = tr.get('name', 'Unknown')
+                artists = ", ".join([a['name'] for a in tr.get('artists', [])])
+                label = f"{name} — {artists}"
+                options.append(label)
+                id_map[label] = (tid, tr, artists)
+            sel = st.selectbox("Pick a track", options) if options else None
+            if "openai_key" not in st.session_state:
+                st.session_state["openai_key"] = ""
+            st.session_state["openai_key"] = st.text_input("OpenAI API Key", type="password", value=st.session_state["openai_key"])
+            model2 = st.selectbox("Model", ["gpt-4.1-mini", "gpt-4o-mini", "gpt-4.1", "o4-mini"], index=0)
+            custom_model2 = st.text_input("Custom model (optional)")
+            chosen_model2 = custom_model2.strip() or model2
+            if sel and st.session_state.get('openai_key') and st.button("Get AI Knowledge for selected recent track"):
+                tid, tr, artists_txt = id_map[sel]
+                md = ask_openai_about_track(st.session_state['openai_key'], chosen_model2, tr, artists_txt)
+                st.markdown(md)
+
 else:
     st.error(f"Failed to fetch 'Recently Played' (status {status_rc}).")
     if isinstance(payload_rc, dict) and "error" in payload_rc:
