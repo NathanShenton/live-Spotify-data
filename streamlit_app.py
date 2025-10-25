@@ -249,7 +249,8 @@ if not token:
 
 # Only start autorefresh once authenticated
 if auto_refresh:
-    st.autorefresh(interval=10_000, key="nowplaying_refresh")
+    import streamlit.components.v1 as components
+    components.html("<script>setTimeout(function(){window.parent.location.reload();}, 10000);</script>", height=0)
 
 access_token = token["access_token"]
 
