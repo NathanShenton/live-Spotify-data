@@ -1,4 +1,4 @@
-# streamlit_app.py
+# app.py
 import os
 import time
 import json
@@ -13,8 +13,10 @@ st.set_page_config(page_title="Live Spotify Data", page_icon="🎧", layout="wid
 # --- Configuration (from Streamlit Secrets) ---
 CLIENT_ID = st.secrets["SPOTIFY_CLIENT_ID"]
 CLIENT_SECRET = st.secrets["SPOTIFY_CLIENT_SECRET"]
-REDIRECT_URI = st.secrets.get("SPOTIFY_REDIRECT_URI", st.experimental_get_query_params().get("redirect_uri", [""])[0])
-# Recommended scopes for now playing + recents
+# Prefer secrets; allow override via query param only if explicitly passed
+REDIRECT_URI = st.secrets.get("SPOTIFY_REDIRECT_URI") or st.query_params.get("redirect_uri")
+
+# Scopes for now playing + recents
 SCOPES = "user-read-currently-playing user-read-playback-state user-read-recently-played"
 
 AUTH_URL = "https://accounts.spotify.com/authorize"
@@ -53,7 +55,6 @@ def exchange_code_for_token(code: str) -> dict:
         st.error(f"Token exchange failed: {resp.status_code} {resp.text}")
         return {}
     tok = resp.json()
-    # Persist token + expiry
     tok["expires_at"] = int(time.time()) + int(tok.get("expires_in", 3600)) - 30  # 30s skew
     return tok
 
@@ -85,11 +86,12 @@ def ensure_token() -> dict | None:
         if new_tok:
             st.session_state["spotify_token"] = new_tok
             return new_tok
-    # Try code in query params
-    q = st.experimental_get_query_params()
-    code = q.get("code", [None])[0]
+
+    # Try code in query params (modern API)
+    q = st.query_params
+    code = q.get("code")
     if code:
-        state_returned = q.get("state", [None])[0]
+        state_returned = q.get("state")
         expected = st.session_state.get("oauth_state")
         if expected and state_returned != expected:
             st.error("State mismatch. Please try logging in again.")
@@ -98,7 +100,7 @@ def ensure_token() -> dict | None:
         if tok:
             st.session_state["spotify_token"] = tok
             # Clean the URL (remove code/state)
-            st.experimental_set_query_params()
+            st.query_params.clear()
             return tok
     return None
 
@@ -169,16 +171,21 @@ def display_recent(payload: dict | None):
                 st.markdown(f"**{name}**")
                 st.caption(f"{artists} — {album}")
             with cols[2]:
+                # present UTC nicely
                 st.caption(played_at.replace("T", " ").replace("Z", " UTC"))
 
 # --- UI ---
 st.title("🎧 Live Spotify Data")
 st.caption("Minimal demo: Now Playing + Recent Plays (secure secrets via Streamlit)")
 
-# Ask for recent limit (1–50)
+# 🔁 Auto-refresh Now Playing every 10 seconds
+# This refreshes the entire app; cheap endpoints, so acceptable for this MVP.
+st.autorefresh(interval=10_000, key="nowplaying_refresh")
+
+# Sidebar: limit for recents
 limit = st.sidebar.slider("Recent tracks to show", min_value=1, max_value=50, value=10)
 
-# Show secret health
+# Secrets status for quick diagnostics
 with st.expander("🔐 Secrets status (local-only)", expanded=False):
     ok_vars = {
         "SPOTIFY_CLIENT_ID": bool(CLIENT_ID),
@@ -187,16 +194,14 @@ with st.expander("🔐 Secrets status (local-only)", expanded=False):
     }
     st.json(ok_vars)
 
-# Ensure we know our redirect_uri
 if not REDIRECT_URI:
-    st.error("Missing SPOTIFY_REDIRECT_URI in secrets. Set it to your deployed app URL (exact match).")
+    st.error("Missing SPOTIFY_REDIRECT_URI. Set it in .streamlit/secrets.toml (exactly matches your Spotify app Redirect URI).")
     st.stop()
 
-# Try to ensure token
+# OAuth: ensure token present/valid
 token = ensure_token()
 
 if not token:
-    # Kick off OAuth
     if "oauth_state" not in st.session_state:
         st.session_state["oauth_state"] = hashlib.sha256(os.urandom(32)).hexdigest()
     auth_link = get_auth_url(st.session_state["oauth_state"])
@@ -206,7 +211,7 @@ if not token:
 
 access_token = token["access_token"]
 
-# Fetch Now Playing
+# Fetch & show Now Playing
 status_np, payload_np = get_currently_playing(access_token)
 if status_np == 200:
     display_now_playing(payload_np)
@@ -215,7 +220,7 @@ elif status_np == 204:
 else:
     st.error(f"Failed to fetch 'Now Playing': {payload_np.get('error', '')}")
 
-# Fetch Recent
+# Fetch & show Recent
 status_rc, payload_rc = get_recent_tracks(access_token, limit=limit)
 if status_rc == 200:
     display_recent(payload_rc)
