@@ -201,7 +201,7 @@ def _meta_chips(item: Dict, feat: Dict = None) -> str:
     track_no = item.get("track_number")
     disc_no = item.get("disc_number")
 
-        chips = []
+    chips = []
 
     if year:
         chips.append(f"📆 Released: {year}")
