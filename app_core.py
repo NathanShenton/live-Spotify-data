@@ -407,17 +407,18 @@ def _now_playing(access_token: str):
             st.session_state.get("openai_key")
             and st.button("Tell Me About This Track")
         ):
-
+        
             with st.spinner("Researching track..."):
-
+        
                 st.session_state["ai_response"] = ask_openai_about_track(
                     st.session_state["openai_key"],
                     chosen_model,
                     item,
                     artists_txt
                 )
-
-                st.markdown(md)
+        
+        if "ai_response" in st.session_state:
+            st.markdown(st.session_state["ai_response"])
 
 def _recent(access_token: str, limit: int):
     code_rc, payload_rc = _get_with_retry(API_RECENTS, _auth_header(access_token), params={"limit": max(1, min(limit, 50))})
