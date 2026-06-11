@@ -341,7 +341,7 @@ def _now_playing(access_token: str):
         cols = st.columns([1, 3])
         with cols[0]:
             if art:
-                st.image(art, use_container_width=True)
+                st.image(art, width=160)
         with cols[1]:
             # Title + artist/album
             live_flag = " • LIVE" if is_playing else " • Paused"
@@ -420,7 +420,7 @@ def _recent(access_token: str, limit: int):
             cols = st.columns([1, 3])
             with cols[0]:
                 if art:
-                    st.image(art, use_container_width=True)
+                    st.image(art, width=80)
             with cols[1]:
                 st.markdown(f"**{name}**")
                 st.caption(f"{artists} — {album}")
