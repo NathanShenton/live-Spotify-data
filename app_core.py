@@ -440,19 +440,40 @@ def run_core_app():
         _error_stop("Missing SPOTIFY_REDIRECT_URI in secrets.")
 
     # Title & controls
+    # Title & controls
+    st.markdown("""
+    <style>
+    .block-container {
+        padding-top: 0.5rem;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
     st.title("🎧 Live Spotify Data")
     st.caption("Now Playing + Recent Plays with audio mood + optional AI Knowledge")
 
     with st.sidebar:
         limit = st.slider("Recent tracks to show", 1, 50, 10)
-        auto_refresh = st.checkbox("Auto-refresh Now Playing (10s)", True)
+
+        auto_refresh = st.checkbox(
+            "Auto-refresh Now Playing (10s)",
+            True
+        )
+
         if st.button("Reset App (hard)"):
             st.cache_data.clear()
             st.cache_resource.clear()
             st.session_state.clear()
-            st.query_params.update({"v": str(int(time.time())), "sid": _rand_sid(), "mode": "core"})
-            st.rerun()
 
+            st.query_params.update(
+                {
+                    "v": str(int(time.time())),
+                    "sid": _rand_sid(),
+                    "mode": "core"
+                }
+            )
+
+            st.rerun()
     # Idle watchdog nudge
     now = time.time()
     last = st.session_state.get("_last_active_ts", now)
