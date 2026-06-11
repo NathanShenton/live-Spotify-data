@@ -341,7 +341,7 @@ def _now_playing(access_token: str):
         cols = st.columns([1, 3])
         with cols[0]:
             if art:
-                st.image(art, width=160)
+                st.image(art, width=200)
         with cols[1]:
             # Title + artist/album
             live_flag = " • LIVE" if is_playing else " • Paused"
