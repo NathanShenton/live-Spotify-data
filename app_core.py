@@ -451,7 +451,7 @@ def run_core_app():
     </style>
     """, unsafe_allow_html=True)
 
-    st.title("🎧 Live Spotify Data")
+    st.title("Live Spotify Data")
 
     st.markdown(
         """
