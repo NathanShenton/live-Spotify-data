@@ -441,19 +441,40 @@ def run_core_app():
 
     # Title & controls
     # Title & controls
+    # Title & controls
+
     st.markdown("""
     <style>
-    .block-container {
-        padding-top: 0.5rem;
-    }
+        .block-container {
+            padding-top: 1rem;
+        }
     </style>
     """, unsafe_allow_html=True)
 
     st.title("🎧 Live Spotify Data")
-    st.caption("Now Playing + Recent Plays with audio mood + optional AI Knowledge")
+
+    st.markdown(
+        """
+        <div style="
+            margin-top:-10px;
+            margin-bottom:15px;
+            color:#888;
+            font-size:0.9rem;
+        ">
+            Now Playing + Recent Plays with audio mood + optional AI Knowledge
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
 
     with st.sidebar:
-        limit = st.slider("Recent tracks to show", 1, 50, 10)
+
+        limit = st.slider(
+            "Recent tracks to show",
+            1,
+            50,
+            10
+        )
 
         auto_refresh = st.checkbox(
             "Auto-refresh Now Playing (10s)",
@@ -461,6 +482,7 @@ def run_core_app():
         )
 
         if st.button("Reset App (hard)"):
+
             st.cache_data.clear()
             st.cache_resource.clear()
             st.session_state.clear()
