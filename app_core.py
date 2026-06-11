@@ -191,7 +191,7 @@ def _fmt_ms(ms: int) -> str:
     m, s = divmod(s, 60)
     return f"{m}:{s:02d}"
 
-def _meta_chips(item: Dict) -> str:
+def _meta_chips(item: Dict, feat: Dict = None) -> str:
     """Render compact chips for key track metadata."""
     album = item.get("album") or {}
     release = album.get("release_date") or ""
@@ -201,16 +201,60 @@ def _meta_chips(item: Dict) -> str:
     track_no = item.get("track_number")
     disc_no = item.get("disc_number")
 
-    chips = []
+        chips = []
+
     if year:
-        chips.append(f"📆 {year}")
+        chips.append(f"📆 Released: {year}")
+
     if popularity is not None:
-        chips.append(f"⭐ {popularity}")
+        chips.append(f"⭐ Popularity: {popularity}/100")
+
     chips.append("⚠️ Explicit" if explicit else "🟢 Clean")
+
     if track_no:
         chips.append(f"🔢 Track {track_no}")
+
     if disc_no and disc_no > 1:
         chips.append(f"💿 Disc {disc_no}")
+
+    if feat:
+
+        bpm = int(round(feat.get("tempo", 0)))
+        energy = int(round(feat.get("energy", 0) * 100))
+        dance = int(round(feat.get("danceability", 0) * 100))
+        valence = int(round(feat.get("valence", 0) * 100))
+
+        if energy < 30:
+            energy_text = "Relaxed"
+        elif energy < 60:
+            energy_text = "Moderate"
+        elif energy < 80:
+            energy_text = "High"
+        else:
+            energy_text = "Very High"
+
+        if dance < 30:
+            dance_text = "Not Danceable"
+        elif dance < 60:
+            dance_text = "Somewhat Danceable"
+        elif dance < 80:
+            dance_text = "Danceable"
+        else:
+            dance_text = "Very Danceable"
+
+        if valence < 30:
+            mood_text = "Melancholic"
+        elif valence < 60:
+            mood_text = "Mixed Mood"
+        elif valence < 80:
+            mood_text = "Positive"
+        else:
+            mood_text = "Euphoric"
+
+        chips.append(f"⏱️ Tempo: {bpm} BPM")
+        chips.append(f"🔥 Energy: {energy_text}")
+        chips.append(f"🕺 Danceability: {dance_text}")
+        chips.append(f"😊 Mood: {mood_text}")
 
     html = "<div style='display:flex;gap:.5rem;flex-wrap:wrap;'>"
     for c in chips:
@@ -358,19 +402,23 @@ def _now_playing(access_token: str):
                 st.caption(f"{_fmt_ms(progress_ms)} / {_fmt_ms(duration_ms)}")
 
             # Metadata chips
-            st.markdown(_meta_chips(item), unsafe_allow_html=True)
-
-            # Audio features badges (mood/energy etc.)
             track_id = item.get("id")
+
+            feat = None
+            
             if track_id:
                 feats = get_audio_features_batch(
                     st.session_state["spotify_token"]["access_token"],
                     [track_id],
                     version_salt=APP_VERSION,
                 )
-                f = feats.get(track_id)
-                if f:
-                    st.markdown(feature_badges(f), unsafe_allow_html=True)
+            
+                feat = feats.get(track_id)
+            
+            st.markdown(
+                _meta_chips(item, feat),
+                unsafe_allow_html=True
+            )
 
     # Optional AI panel
     with cols[2]:
