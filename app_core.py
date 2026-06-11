@@ -376,19 +376,51 @@ def _now_playing(access_token: str):
                     st.markdown(feature_badges(f), unsafe_allow_html=True)
 
     # Optional AI panel
-    with st.expander("🧠 AI Knowledge (optional)", expanded=False):
-        st.caption("Paste your OpenAI API key locally (not stored).")
+    with cols[2]:
+
+        st.markdown("### 🤖 Tell Me About This Track & Artist")
+
+        st.write(
+            "Use AI to learn about the song, artist, meaning, "
+            "background and similar recommendations."
+        )
+
         if "openai_key" not in st.session_state:
             st.session_state["openai_key"] = ""
+
         st.session_state["openai_key"] = st.text_input(
-            "OpenAI API Key", type="password", value=st.session_state["openai_key"]
+            "OpenAI API Key",
+            type="password",
+            value=st.session_state["openai_key"]
         )
-        model = st.selectbox("Model", ["gpt-4.1-mini", "gpt-4o-mini", "gpt-4.1"], index=0)
-        custom_model = st.text_input("Custom model (optional)")
+
+        model = st.selectbox(
+            "Model",
+            ["gpt-4.1-mini", "gpt-4o-mini", "gpt-4.1"],
+            index=0
+        )
+
+        custom_model = st.text_input(
+            "Custom model (optional)"
+        )
+
         chosen_model = custom_model.strip() or model
-        if st.session_state.get("openai_key") and st.button("Get AI Knowledge for current song"):
-            md = ask_openai_about_track(st.session_state["openai_key"], chosen_model, item, artists_txt)
-            st.markdown(md)
+
+        if (
+            st.session_state.get("openai_key")
+            and st.button("Tell Me About This Track")
+        ):
+
+            with st.spinner("Researching track..."):
+
+                md = ask_openai_about_track(
+                    st.session_state["openai_key"],
+                    chosen_model,
+                    item,
+                    artists_txt
+                )
+
+                st.markdown(md)
 
 def _recent(access_token: str, limit: int):
     code_rc, payload_rc = _get_with_retry(API_RECENTS, _auth_header(access_token), params={"limit": max(1, min(limit, 50))})
