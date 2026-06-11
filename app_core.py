@@ -316,15 +316,16 @@ Return in this structure:
 # --------------------------
 # UI helpers
 # --------------------------
+
 def _now_playing(access_token: str):
     code, payload = _get_with_retry(API_ME_PLAYER, _auth_header(access_token))
+
     if code == 204:
         st.info("Nothing is currently playing.")
         return
+
     if code != 200:
         st.error(f"Failed to fetch 'Now Playing' (status {code}).")
-        if isinstance(payload, dict) and payload.get("error"):
-            st.code(payload["error"])
         return
 
     item = (payload or {}).get("item") or {}
@@ -332,104 +333,82 @@ def _now_playing(access_token: str):
     progress_ms = int((payload or {}).get("progress_ms") or 0)
     duration_ms = int(item.get("duration_ms") or 0)
 
-    artists_txt = ", ".join([a["name"] for a in item.get("artists", [])]) or "Unknown Artist"
+    artists_txt = ", ".join([a["name"] for a in item.get("artists", [])])
     name = item.get("name", "Unknown Track")
     album = (item.get("album") or {}).get("name", "Unknown Album")
     art = (item.get("album", {}).get("images") or [{}])[0].get("url")
 
-    with st.container(border=True):
-        cols = st.columns([1, 3])
-        with cols[0]:
-            if art:
-                st.image(art, use_container_width=True)
-        with cols[1]:
-            # Title + artist/album
-            live_flag = " • LIVE" if is_playing else " • Paused"
-            st.markdown(f"### 🎵 {name}{live_flag}")
-            st.caption(f"{artists_txt} — {album}")
+    show_ai = st.session_state.get("show_ai", False)
 
-            # Progress bar + timecodes
-            if duration_ms > 0:
-                ratio = max(0.0, min(1.0, progress_ms / duration_ms))
-                st.progress(ratio)
-                st.caption(f"{_fmt_ms(progress_ms)} / {_fmt_ms(duration_ms)}")
+    if show_ai:
+        left, centre, right = st.columns([1, 3, 2])
+    else:
+        left, centre = st.columns([1, 5])
 
-            # Metadata chips
-            st.markdown(_meta_chips(item), unsafe_allow_html=True)
+    with left:
+        if art:
+            st.image(art, width=120)
 
-            # Audio features badges (mood/energy etc.)
-            track_id = item.get("id")
-            if track_id:
-                feats = get_audio_features_batch(
-                    st.session_state["spotify_token"]["access_token"],
-                    [track_id],
-                    version_salt=APP_VERSION,
-                )
-                f = feats.get(track_id)
-                if f:
-                    st.markdown(feature_badges(f), unsafe_allow_html=True)
+    with centre:
+        st.markdown(f"### 🎵 {name}")
+        st.caption(f"{artists_txt} • {album}")
+        st.write("🟢 Playing" if is_playing else "⏸️ Paused")
 
-    # Optional AI panel
-    with st.expander("🧠 AI Knowledge (optional)", expanded=False):
-        st.caption("Paste your OpenAI API key locally (not stored).")
-        if "openai_key" not in st.session_state:
-            st.session_state["openai_key"] = ""
-        st.session_state["openai_key"] = st.text_input(
-            "OpenAI API Key", type="password", value=st.session_state["openai_key"]
-        )
-        model = st.selectbox("Model", ["gpt-4.1-mini", "gpt-4o-mini", "gpt-4.1"], index=0)
-        custom_model = st.text_input("Custom model (optional)")
-        chosen_model = custom_model.strip() or model
-        if st.session_state.get("openai_key") and st.button("Get AI Knowledge for current song"):
-            md = ask_openai_about_track(st.session_state["openai_key"], chosen_model, item, artists_txt)
-            st.markdown(md)
+        if duration_ms > 0:
+            st.progress(max(0.0, min(1.0, progress_ms / duration_ms)))
+            st.caption(f"{_fmt_ms(progress_ms)} / {_fmt_ms(duration_ms)}")
+
+        st.markdown(_meta_chips(item), unsafe_allow_html=True)
+
+    if show_ai:
+        with right:
+            st.markdown("#### 🧠 AI Insight")
+            if "openai_key" not in st.session_state:
+                st.session_state["openai_key"] = ""
+
+            st.session_state["openai_key"] = st.text_input(
+                "OpenAI API Key",
+                type="password",
+                value=st.session_state["openai_key"]
+            )
+
+    st.divider()
+
 
 def _recent(access_token: str, limit: int):
-    code_rc, payload_rc = _get_with_retry(API_RECENTS, _auth_header(access_token), params={"limit": max(1, min(limit, 50))})
+    code_rc, payload_rc = _get_with_retry(
+        API_RECENTS,
+        _auth_header(access_token),
+        params={"limit": max(1, min(limit, 50))}
+    )
+
     if code_rc != 200:
-        st.error(f"Failed to fetch 'Recently Played' (status {code_rc}).")
-        if isinstance(payload_rc, dict) and payload_rc.get("error"):
-            st.code(payload_rc["error"])
+        st.error("Failed to fetch recent tracks.")
         return
 
     items = payload_rc.get("items", []) or []
-    # Collect track IDs (skip any None / local tracks)
-    ids = []
-    for it in items:
-        tr = it.get("track") or {}
-        tid = tr.get("id")
-        if tid:
-            ids.append(tid)
-
-    feats_map: Dict[str, Dict] = {}
-    if ids:
-        feats_map = get_audio_features_batch(
-            st.session_state["spotify_token"]["access_token"],
-            ids,
-            version_salt=APP_VERSION
-        )
 
     st.markdown("### ⏮️ Recently Played")
+
     for it in items:
         tr = it.get("track") or {}
+
         name = tr.get("name", "Unknown")
         artists = ", ".join([a["name"] for a in tr.get("artists", [])])
-        album = (tr.get("album") or {}).get("name", "")
+
         art = (tr.get("album", {}).get("images") or [{}])[0].get("url")
-        with st.container(border=True):
-            cols = st.columns([1, 3])
-            with cols[0]:
-                if art:
-                    st.image(art, use_container_width=True)
-            with cols[1]:
-                st.markdown(f"**{name}**")
-                st.caption(f"{artists} — {album}")
-        tid = tr.get("id")
-        if tid and tid in feats_map:
-            st.markdown(feature_badges(feats_map[tid]), unsafe_allow_html=True)
-        else:
-            # No features (local track / unavailable / API miss) — don't fail
-            pass
+
+        img_col, txt_col = st.columns([0.35, 5])
+
+        with img_col:
+            if art:
+                st.image(art, width=55)
+
+        with txt_col:
+            st.markdown(f"**{name}**")
+            st.caption(artists)
+
+        st.divider()
 
 # ------------
 # Main entry
@@ -443,8 +422,15 @@ def run_core_app():
     st.title("🎧 Live Spotify Data")
     st.caption("Now Playing + Recent Plays with audio mood + optional AI Knowledge")
 
+    st.markdown("""
+    <style>
+    .main .block-container {max-width:1500px;padding-top:1rem;}
+    [data-testid="stImage"] img {border-radius:8px;}
+    </style>
+    """, unsafe_allow_html=True)
+
     with st.sidebar:
-        limit = st.slider("Recent tracks to show", 1, 50, 10)
+        limit = st.slider("Recent tracks to show", 5, 50, 10)\n        show_ai = st.checkbox("Show AI Insights", value=False)\n        st.session_state["show_ai"] = show_ai
         auto_refresh = st.checkbox("Auto-refresh Now Playing (10s)", True)
         if st.button("Reset App (hard)"):
             st.cache_data.clear()
