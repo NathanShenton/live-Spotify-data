@@ -338,8 +338,14 @@ def _now_playing(access_token: str):
     art = (item.get("album", {}).get("images") or [{}])[0].get("url")
 
     with st.container(border=True):
-        cols = st.columns([1, 3])
+
+        cols = st.columns([1, 3, 2])
+    
         with cols[0]:
+            if art:
+                st.image(art, width=200)
+    
+        with cols[1]:
             if art:
                 st.image(art, width=200)
         with cols[1]:
