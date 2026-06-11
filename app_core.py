@@ -410,7 +410,7 @@ def _now_playing(access_token: str):
 
             with st.spinner("Researching track..."):
 
-                md = ask_openai_about_track(
+                st.session_state["ai_response"] = ask_openai_about_track(
                     st.session_state["openai_key"],
                     chosen_model,
                     item,
